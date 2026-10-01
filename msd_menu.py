@@ -57,6 +57,7 @@ def load_settings() -> dict:
         "schedule": schedule,
         "autostart": bool(s.get("autostart", False)),
         "startup_delay_min": int(s.get("startup_delay_min", DEFAULT_DELAY_MIN)),
+        "show_browser": bool(s.get("show_browser", False)),
     }
 
 
@@ -162,6 +163,7 @@ def show(s: dict) -> None:
     auto = (f"ON - {s['startup_delay_min']} minute(s) after you log in to Windows" if s["autostart"]
             else "OFF")
     print(f"\n  Automatic download: {auto}")
+    print(f"  Browser windows while downloading: {'SHOWN' if s['show_browser'] else 'HIDDEN'}")
     due = due_jobs(s, date.today())
     print(f"  Still to download today: {', '.join(r.name for r, _, _ in due) if due else 'nothing'}")
     print("""
@@ -171,6 +173,7 @@ def show(s: dict) -> None:
   O  Change the order
   H  Change how often some reports download
   A  Automatic download settings
+  B  Browser windows: show / hide while downloading
   X  Exit
 """)
 
@@ -364,11 +367,17 @@ def menu() -> int:
             change_schedule(s)
         elif choice == "a":
             change_autostart(s)
+        elif choice == "b":
+            s["show_browser"] = not s["show_browser"]
+            bot.SHOW_BROWSER = s["show_browser"]
+            save_settings(s)
         elif choice == "x":
             return 0
 
 
 def main(args: list[str]) -> int:
+    s = load_settings()
+    bot.SHOW_BROWSER = s["show_browser"] or "--show" in args
     if "--scheduled" in args:
-        return run_scheduled(load_settings(), wait="--now" not in args)
+        return run_scheduled(s, wait="--now" not in args)
     return menu()

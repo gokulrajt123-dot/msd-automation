@@ -82,6 +82,7 @@ Double-click **`Run MSD Automation.bat`**. You will see a list of reports and th
   O  Change the order
   H  Change how often some reports download
   A  Automatic download settings
+  B  Browser windows: show / hide while downloading
   X  Exit
 ```
 
@@ -117,6 +118,11 @@ Those download first; the others follow in their old order.
 ### A - Automatic download
 Switch it **on or off**, and set **how many minutes after switching on the computer** it starts.
 
+### B - Show or hide the browser
+Normally the downloads happen **invisibly** in the background, so you can keep working.
+Press **B** to see the browser windows while it downloads (useful if something goes wrong).
+Press **B** again to hide them.
+
 ### X - Exit
 Closes the menu.
 
@@ -147,9 +153,10 @@ Old files are never deleted or replaced.
 
 ## Part 4 - While it is downloading
 
-- Browser windows open and close by themselves. **Please don't close them or click inside them.**
+- The downloading happens **invisibly** in the background - you can keep working normally.
 - A black window shows what is happening. Some reports are slow (Parts stock can take 15-30 minutes).
-- If MSD asks you to **approve a login on your phone**, approve it. The tool waits for you.
+- If MSD asks you to **approve a login on your phone** (or type an OTP), a browser window opens
+  for that. Approve it / type it there. The tool waits for you, then continues invisibly.
 - When everything is done, the black window shows **SUCCESS**.
   If something failed, it shows which report - just download that one again with **C**.
 - When the automatic download starts after switching on the computer, a small window appears.

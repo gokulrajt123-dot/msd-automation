@@ -6,7 +6,8 @@ Period: 1st of this month to today; when run on the 1st, the whole previous mont
 
   msd_bot.py                  menu (order, how often, auto-start, download now) - see msd_menu.py
   msd_bot.py --scheduled      download today's scheduled reports (used by auto-start)
-  msd_bot.py --report "Sales register" [--report ...] [--today]   download these reports now
+  msd_bot.py --report "Sales register" [--report ...] [--today] [--show]   download these reports now
+                              (--show: browser windows visible; normally they are hidden)
 
 Login flow:
   1. Microsoft login   -> enter email, Next
@@ -80,6 +81,11 @@ REPORTS_BY_NAME = {r.name.lower(): r for r in REPORTS}
 
 # Very big whole-list exports: count the rows afterwards and ask the user to check the file is complete.
 CHECK_COMPLETE = {"REAssure Incentive Claims"}
+
+# Browsers run hidden. Only when MSD needs the user at login (phone approval / OTP) a visible window
+# opens. The menu (B) or --show makes all browser windows visible, e.g. to see what goes wrong.
+SHOW_BROWSER = False
+NEEDS_USER_SEC = 45  # hidden login stuck on an unknown screen this long -> it needs the user
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
 LOGIN_ROUNDS = 3
@@ -175,6 +181,10 @@ def on_landing_page(page: Page) -> bool:
         return False
 
 
+class NeedsUser(RuntimeError):
+    """The hidden browser's login waits for something only the user can do (approval / OTP)."""
+
+
 class LoginSteps:
     """Remembers how often / how recently each login step was done, so a step can be
     repeated when MSD asks to log in again, without hammering it (e.g. wrong password)."""
@@ -196,11 +206,13 @@ class LoginSteps:
         self.last[step] = time.time()
 
 
-def login_attempt(page: Page, cfg: dict, timeout_sec: int) -> bool:
-    """One pass through the login screens. Returns True once the landing page shows."""
+def login_attempt(page: Page, cfg: dict, timeout_sec: int, hidden: bool = False) -> bool:
+    """One pass through the login screens. Returns True once the landing page shows.
+    hidden: raise NeedsUser instead of waiting for an approval / OTP nobody can see."""
     steps = LoginSteps()
     deadline = time.time() + timeout_sec
     waiting_msg_shown = False
+    unknown_since = None  # when the current unrecognised (non-MSD) screen appeared
 
     while time.time() < deadline:
         if on_landing_page(page):
@@ -260,30 +272,39 @@ def login_attempt(page: Page, cfg: dict, timeout_sec: int) -> bool:
             continue
 
         # Anything else (loading, approval on phone, OTP, ...): wait so the user can finish it.
-        if "dynamics.com" not in url and not waiting_msg_shown:
-            log(">> If an approval / OTP is shown, please complete it in the browser. Waiting...")
-            waiting_msg_shown = True
+        if "dynamics.com" in url:
+            unknown_since = None
+        else:
+            unknown_since = unknown_since or time.time()
+            if hidden and time.time() - unknown_since > NEEDS_USER_SEC:
+                raise NeedsUser("MSD login needs an approval / OTP.")
+            if not hidden and not waiting_msg_shown:
+                log(">> If an approval / OTP is shown, please complete it in the browser. Waiting...")
+                waiting_msg_shown = True
         page.wait_for_timeout(1000)
 
     return False
 
 
-def launch_browser(p, cfg: dict):
+def launch_browser(p, cfg: dict, hidden: bool):
     """Start a fresh browser (Playwright's Chromium; else installed Chrome, then Edge) with the
-    saved login cookies of this user, if any."""
+    saved login cookies of this user, if any. hidden: no window on screen."""
     state = cfg["session_file"] if cfg["session_file"].exists() else None
     for channel in (None, "chrome", "msedge"):  # None = Playwright's bundled Chromium
         try:
             browser = p.chromium.launch(
                 channel=channel,
-                headless=False,
+                headless=hidden,
                 chromium_sandbox=True,  # avoids the "--no-sandbox" warning bar
                 downloads_path=str(DOWNLOAD_DIR),
-                args=["--start-maximized"],
+                args=[] if hidden else ["--start-maximized"],
             )
-            context = browser.new_context(storage_state=state, accept_downloads=True, no_viewport=True)
+            # Hidden: a full-HD page, so MSD lays out its menus as on a normal screen.
+            size = {"viewport": {"width": 1920, "height": 1080}} if hidden else {"no_viewport": True}
+            context = browser.new_context(storage_state=state, accept_downloads=True, **size)
             context.new_page()
-            log(f"Browser started ({channel or 'chromium'}{', saved login loaded' if state else ''})")
+            log(f"Browser started ({channel or 'chromium'}{', hidden' if hidden else ''}"
+                f"{', saved login loaded' if state else ''})")
             return context
         except Exception as e:
             log(f"Could not start {channel or 'chromium'}: {str(e).splitlines()[0][:200]}")
@@ -734,7 +755,12 @@ def log_in_and_save(cfg: dict) -> None:
     with sync_playwright() as p:
         context = None
         try:
-            context = login(p, cfg)
+            try:
+                context = login(p, cfg)
+            except NeedsUser:
+                log(">> MSD needs your approval / OTP to log in - opening a browser window. "
+                    "Please complete it there.")
+                context = login(p, cfg, hidden=False)
             log(f"Logged in to MSD as {cfg['email']}.")
             save_session(context, cfg)
         except Exception:
@@ -799,6 +825,8 @@ def main() -> int:
 
     # Command line: --report "Sales register" [--report "Booking statement" ...] [--today]
     today_only = "--today" in sys.argv  # test mode: only today's data
+    global SHOW_BROWSER
+    SHOW_BROWSER = "--show" in sys.argv
     reports = []
     for i, arg in enumerate(sys.argv):
         if arg == "--report":
@@ -812,8 +840,10 @@ def main() -> int:
     return 1 if failed else 0
 
 
-def login(p, cfg: dict):
-    """Open a browser and get to the MSD landing page. Returns the browser context."""
+def login(p, cfg: dict, hidden: bool | None = None):
+    """Open a browser and get to the MSD landing page. Returns the browser context.
+    hidden (default: unless SHOW_BROWSER): raises NeedsUser if the login needs the user."""
+    hidden = not SHOW_BROWSER if hidden is None else hidden
     context = None
     for round_no in range(1, LOGIN_ROUNDS + 1):
         try:
@@ -822,12 +852,12 @@ def login(p, cfg: dict):
                 if context is not None:
                     log("Browser was closed - opening it again.")
                     close_browser(context)
-                context = launch_browser(p, cfg)
+                context = launch_browser(p, cfg, hidden)
 
             page = current_page(context)
             log(f"Opening {cfg['url']} (attempt {round_no} of {LOGIN_ROUNDS})")
             page.goto(cfg["url"], wait_until="commit", timeout=120_000)
-            if login_attempt(page, cfg, LOGIN_TIMEOUT_SEC):
+            if login_attempt(page, cfg, LOGIN_TIMEOUT_SEC, hidden):
                 log("Landing page reached.")
                 return context
             log("Landing page not reached yet - starting login again.")
