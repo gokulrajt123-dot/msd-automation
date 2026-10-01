@@ -46,6 +46,9 @@ DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
 #   "ssrs" - dates dialog -> OK -> report shown on screen -> Export -> Excel
 #   "grid" - page with From/To date -> Office icon -> Export to Excel: <report> -> Download
 #   "grid+generate" - same as "grid", but press Generate after the dates
+#   "list:<home tile>" - home tile (e.g. Part) -> tile with the report's name -> Office icon -> Export to Excel
+#              -> Download (no dates: the whole list is exported). "list:<home tile>><tile>" when the tile's
+#              name differs from the report's (e.g. three workspaces each have a "Stock Report" tile).
 #   "tilldate" - dialog with only a Till date (= end of the period) -> OK -> Download
 REPORTS = [
     ("Job Card Invoice Statement", "ssrs"),
@@ -60,10 +63,26 @@ SEPARATE_REPORTS = [
     ("Return Invoice Statement", "grid"),
     ("Vehicle Stock Ageing", "tilldate"),
     ("Cancelled booking statement", "grid+generate"),
+    ("REAssure Incentive Claims", "list:Part>Claims"),  # all claims (~5 years) - a very big download
+    ("Parts stock", "list:Part>Stock Report"),
+    ("GMA stock", "list:GMA>Stock Report"),
+    ("Gear stock", "list:Gear>Stock Report"),
+    ("Service claim report", "grid+generate"),
 ]
+
+# Reports that log in with a different MSD account (.env: <ACCOUNT>_EMAIL, _USERNAME, _PASSWORD).
+REPORT_ACCOUNT = {
+    "REAssure Incentive Claims": "PARTS",
+    "Parts stock": "PARTS",
+    "Service claim report": "PARTS",
+}
+
+# Very big whole-list exports: count the rows afterwards and ask the user to check the file is complete.
+CHECK_COMPLETE = {"REAssure Incentive Claims"}
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
 LOGIN_ROUNDS = 3
+EXPORT_TRIES = 3  # start a report again when MSD's download link expired before the file was ready
 REPORT_TIMEOUT_SEC = 4 * 60 * 60  # a month of data can take 2+ hours
 
 
@@ -93,7 +112,8 @@ def log(msg: str) -> None:
             pass
 
 
-def load_config() -> dict:
+def load_config(account: str = "") -> dict:
+    """Login details from .env. account="PARTS" reads PARTS_EMAIL / PARTS_USERNAME / PARTS_PASSWORD."""
     env_file = BASE_DIR / ".env"
     if not env_file.exists() or env_file.stat().st_size == 0:
         sys.exit("ERROR: .env file is missing or empty. See .env.example for what to put in it.")
@@ -104,11 +124,20 @@ def load_config() -> dict:
     def pick(*keys: str) -> str:
         return next((raw[k] for k in keys if raw.get(k)), "")
 
-    cfg = {
-        "email": pick("MSD_USERNAME", "USERNAME", "MSD_EMAIL", "EMAIL", "USER"),
-        "password": pick("MSD_PASSWORD", "PASSWORD", "PASS"),
-    }
-    missing = [k for k, v in cfg.items() if not v]
+    if account:
+        pre = account.upper() + "_"
+        cfg = {
+            "email": pick(pre + "EMAIL", pre + "USER_ID", pre + "USERNAME"),
+            "password": pick(pre + "PASSWORD"),
+        }
+        sso_user = pick(pre + "SSO_USERNAME", pre + "USERNAME")
+    else:
+        cfg = {
+            "email": pick("MSD_EMAIL", "EMAIL", "USER_ID", "MSD_USERNAME", "USERNAME", "USER"),
+            "password": pick("MSD_PASSWORD", "PASSWORD", "PASS"),
+        }
+        sso_user = pick("SSO_USERNAME", "MSD_USERNAME", "USERNAME")
+    missing = [f"{account.upper() + '_' if account else ''}{k.upper()}" for k, v in cfg.items() if not v]
     if missing:
         sys.exit(f"ERROR: missing in .env: {', '.join(missing)}. See .env.example.")
 
@@ -121,7 +150,7 @@ def load_config() -> dict:
         url = DEFAULT_MSD_URL
     cfg["url"] = url
 
-    cfg["sso_user"] = pick("SSO_USERNAME") or cfg["email"].split("@")[0]
+    cfg["sso_user"] = sso_user or cfg["email"].split("@")[0]
     # Separate saved login per MSD user, so switching ids never reuses someone else's session.
     cfg["session_file"] = SESSION_DIR / (re.sub(r"[^\w.-]", "_", cfg["sso_user"].lower()) + ".json")
     if "@" not in cfg["email"]:  # Microsoft login needs the full email
@@ -303,6 +332,22 @@ def save_error_screenshot(context) -> None:
         pass
 
 
+def reconnect_if_needed(page: Page) -> None:
+    """Answer MSD's pop-ups that stop a long export:
+    'It appears you lost network connectivity' -> Reconnect,
+    'The operation is taking a long time to process, click Wait ...' -> Wait."""
+    for name, msg in (("Reconnect", "MSD lost its connection - clicking Reconnect"),
+                      ("Wait", "MSD says the export is taking long - clicking Wait")):
+        try:
+            btn = page.get_by_role("button", name=re.compile(rf"^\s*{name}\s*$", re.I)).locator("visible=true")
+            if btn.count():
+                log(msg)
+                btn.first.click(timeout=10_000)
+                page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
+
 def wait_until_idle(page: Page, timeout_ms: int = 120_000) -> None:
     """D365 shows a transparent 'please wait' layer while busy; clicks during that time are lost."""
     page.locator("#ShellBlockingDiv").wait_for(state="hidden", timeout=timeout_ms)
@@ -311,6 +356,7 @@ def wait_until_idle(page: Page, timeout_ms: int = 120_000) -> None:
 
 def click_when_ready(page: Page, locator, what: str, tries: int = 5) -> None:
     for attempt in range(1, tries + 1):
+        reconnect_if_needed(page)
         try:
             wait_until_idle(page, 30_000)
             locator.scroll_into_view_if_needed(timeout=30_000)
@@ -321,6 +367,33 @@ def click_when_ready(page: Page, locator, what: str, tries: int = 5) -> None:
                 raise RuntimeError(f"Could not click '{what}': {str(e).splitlines()[0][:150]}")
             log(f"'{what}' not clickable yet - retrying ({attempt}/{tries})")
             page.wait_for_timeout(3000)
+
+
+def open_list_page(page: Page, home_tile: str, tile_name: str) -> None:
+    """Home page tile (workspace, e.g. 'Part') -> tile of a list page (e.g. 'Claims')."""
+    log(f"Opening '{home_tile}' workspace")
+    tile = page.locator(".tile-text").get_by_text(home_tile, exact=True).locator("visible=true").first
+    click_when_ready(page, tile, home_tile)
+    wait_until_idle(page)
+    log(f"Opening '{tile_name}'")
+    tiles = page.locator(".tile-text").locator("visible=true")
+    tiles.first.wait_for(state="visible", timeout=120_000)
+    exact = tiles.filter(has_text=re.compile(rf"^\s*{re.escape(tile_name)}\s*$", re.I))
+    if not exact.count():
+        raise RuntimeError(f"No tile named '{tile_name}' in the '{home_tile}' workspace.")
+    # Some list pages (e.g. GMA / Gear stock) take a minute to open; the workspace stays on screen
+    # meanwhile, so wait until its tiles are gone (click again if the click was lost).
+    for attempt in range(1, 4):
+        click_when_ready(page, exact.first, tile_name)
+        try:
+            exact.first.wait_for(state="hidden", timeout=300_000)
+            break
+        except Exception:
+            if attempt == 3:
+                raise RuntimeError(f"'{tile_name}' did not open.")
+            log(f"'{tile_name}' did not open yet - clicking again")
+    page.locator("[role='grid']").locator("visible=true").first.wait_for(state="visible", timeout=300_000)
+    wait_until_idle(page, 300_000)
 
 
 def open_report_dialog(page: Page, report_name: str, first_field: str = "From Date") -> None:
@@ -369,7 +442,10 @@ def set_date(page: Page, label: str, value: date) -> None:
 def run_report(context, page: Page, report_name: str, kind: str, from_date: date, to_date: date,
                run_dir: Path) -> Path:
     """Open the report, fill the dates, export to Excel and save it in run_dir/<report name>/."""
-    if kind == "tilldate":
+    if kind.startswith("list:"):
+        home_tile, _, tile = kind.split(":", 1)[1].partition(">")
+        open_list_page(page, home_tile, tile or report_name)
+    elif kind == "tilldate":
         open_report_dialog(page, report_name, "Till date")
         to_date = date.today()  # stock as on today, also on the 1st of the month
         set_date(page, "Till date", to_date)
@@ -384,7 +460,9 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
     context.on("page", lambda pg: pg.on("download", lambda d: downloads.append(d)))
 
     started = time.time()
-    if kind.startswith("grid"):
+    if kind.startswith("list:"):
+        export_grid(context, page, report_name, started)
+    elif kind.startswith("grid"):
         if kind == "grid+generate":
             log("Pressing Generate")
             generate = page.get_by_role("button", name=re.compile(r"^\s*Generate\s*$", re.I)).locator("visible=true").first
@@ -398,20 +476,83 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
 
     # Wait for the Excel file.
     log("Excel export requested - waiting for the download")
-    wait_long(context, started, "Excel download", lambda: bool(downloads))
+    def downloaded() -> bool:
+        if downloads:
+            return True
+        if export_link_expired(context):
+            raise ExportLinkExpired("MSD's download link expired before the Excel file was ready "
+                                    "(AuthenticationFailed / 'Signature not valid in the specified key time frame').")
+        return False
+
+    wait_long(context, started, "Excel download", downloaded)
 
     target_dir = run_dir / report_name.strip(" .")
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloads[0]
     ext = Path(dl.suggested_filename).suffix or ".xlsx"
-    period = f"till {to_date:%d-%m-%Y}" if kind == "tilldate" else f"{from_date:%d-%m-%Y} to {to_date:%d-%m-%Y}"
+    period = f"till {to_date:%d-%m-%Y}" if kind == "tilldate" else f"all till {date.today():%d-%m-%Y}" if kind.startswith("list:") else f"{from_date:%d-%m-%Y} to {to_date:%d-%m-%Y}"
     name = f"{report_name.strip(' .')} {period}{ext}"
     target = unique_path(target_dir / name)  # never overwrite an earlier download
     log(f"Download started ({dl.suggested_filename}) - saving...")
     dl.save_as(str(target))  # waits for the download to finish, however long it takes
     any_open_page(context).wait_for_timeout(3000)  # small pause before moving on / closing
     log(f"Downloaded in {minutes(started)} min: {target}")
+    if report_name in CHECK_COMPLETE:
+        check_full_export(target, report_name)
     return target
+
+
+EXCEL_MAX_ROWS = 1_048_576
+
+
+def check_full_export(path: Path, report_name: str) -> None:
+    """Count the data rows in a whole-list export, show the oldest/newest date, and ask the user to
+    check it is complete (MSD can stop an Excel export at a row limit without saying so)."""
+    import zipfile
+    from xml.etree.ElementTree import fromstring, iterparse
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            sheet = next(n for n in sorted(names) if re.match(r"xl/worksheets/sheet\d*\.xml$", n))
+            strings = []
+            if "xl/sharedStrings.xml" in names:
+                strings = ["".join(t.text or "" for t in si.iter() if t.tag.endswith("}t"))
+                           for si in fromstring(z.read("xl/sharedStrings.xml")) if si.tag.endswith("}si")]
+            rows, date_col, dates = 0, None, []
+            with z.open(sheet) as f:
+                for _, el in iterparse(f):
+                    if not el.tag.endswith("}row"):
+                        continue
+                    rows += 1
+                    for i, c in enumerate(x for x in el if x.tag.endswith("}c")):
+                        v = next((x.text for x in c if x.tag.endswith("}v")), None)
+                        if v is None:
+                            continue
+                        if rows == 1 and c.get("t") == "s" and date_col is None                                 and "date" in strings[int(v)].lower():
+                            date_col = i  # first column with "date" in its heading
+                        elif rows > 1 and i == date_col:
+                            try:
+                                dates.append(float(v))
+                            except ValueError:
+                                pass
+                    el.clear()
+        data_rows = max(rows - 1, 0)  # minus the header row
+    except Exception as e:
+        log(f"PLEASE CHECK '{report_name}': could not count the rows ({type(e).__name__} {str(e)[:100]}). "
+            "Open the file and check it.")
+        return
+    size_mb = path.stat().st_size / 1_048_576
+    span = ""
+    if dates:  # Excel stores dates as days since 30-Dec-1899
+        oldest, newest = (date(1899, 12, 30) + timedelta(days=int(d)) for d in (min(dates), max(dates)))
+        span = f", dates {oldest:%d-%b-%Y} to {newest:%d-%b-%Y}"
+    log(f"'{report_name}': {data_rows:,} rows{span}, {size_mb:.1f} MB")
+    if rows >= EXCEL_MAX_ROWS:
+        log(f"WARNING '{report_name}': the file is at Excel's maximum of {EXCEL_MAX_ROWS:,} rows - data is MISSING.")
+    elif data_rows and data_rows % 10_000 == 0:
+        log(f"WARNING '{report_name}': exactly {data_rows:,} rows looks like an export limit - data may be MISSING.")
+    log(f">> PLEASE CHECK '{report_name}' is complete: open {path.name} and check the dates cover all the "
+        f"years and the row count ({data_rows:,}) matches MSD.")
 
 
 def export_grid(context, page: Page, report_name: str, started: float) -> None:
@@ -439,9 +580,10 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
     ).locator("visible=true").first
 
     for attempt in range(1, 6):
-        click_when_ready(page, office, "Open in Microsoft Office")
+        if not heading.is_visible():  # the icon opens/closes the menu, so only click when it's closed
+            click_when_ready(page, office, "Open in Microsoft Office")
         try:
-            heading.wait_for(state="visible", timeout=15_000)
+            heading.wait_for(state="visible", timeout=60_000)  # slow on big pages (e.g. GMA stock)
             item = named if named.count() else below
             log(f"Clicking 'Export to Excel' -> '{item.inner_text(timeout=15_000).strip()}'")
             item.click(timeout=15_000)
@@ -450,7 +592,7 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
             if attempt == 5:
                 raise RuntimeError(f"The Office menu did not show 'Export to Excel: {report_name}'.")
             log("Office menu not ready - trying again")
-            page.keyboard.press("Escape")
+            # No Escape here: in MSD it closes the whole page, not just the menu.
             page.wait_for_timeout(5000)
 
     # Side panel "Export to Excel" -> Download
@@ -460,10 +602,8 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
         page.locator("button, [role='button'], a").filter(has_text=download_re)
         .or_(page.get_by_text(download_re))
     ).locator("visible=true").first
-    try:
-        download_btn.wait_for(state="visible", timeout=120_000)
-    except Exception:
-        raise RuntimeError("The 'Export to Excel' panel with the Download button did not open.")
+    # Big lists (e.g. Parts stock) show "Please wait. We're processing your request" for many minutes first.
+    wait_long(context, started, "'Export to Excel' panel with the Download button", lambda: download_btn.count() > 0)
     click_when_ready(page, download_btn, "Download")
 
 
@@ -521,6 +661,21 @@ def export_ssrs(context, page: Page, from_date: date, to_date: date, started: fl
             page.wait_for_timeout(5000)
 
 
+class ExportLinkExpired(RuntimeError):
+    """MSD's Excel download link is only valid for a short time; a very slow export can outlast it."""
+
+
+def export_link_expired(context) -> bool:
+    """True if a tab shows the Azure storage 'AuthenticationFailed' page instead of downloading the file."""
+    for pg in context.pages:
+        try:
+            if not pg.is_closed() and "blob.core.windows.net" in pg.url                     and "AuthenticationFailed" in pg.content():
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def unique_path(path: Path) -> Path:
     """'file.xlsx' -> 'file (2).xlsx', 'file (3).xlsx', ... if the name is already taken."""
     n = 2
@@ -540,6 +695,8 @@ def wait_long(context, started: float, what: str, done) -> None:
     Waits on any open tab, because MSD closes its own tab after the Excel export."""
     next_note = time.time() + 300
     while not done():
+        if browser_alive(context):
+            reconnect_if_needed(current_page(context))
         if time.time() - started > REPORT_TIMEOUT_SEC:
             raise TimeoutError(f"Gave up waiting for the {what} after {REPORT_TIMEOUT_SEC // 3600} hours.")
         if time.time() >= next_note:
@@ -573,7 +730,10 @@ def main() -> int:
         if not reports:
             names = ", ".join(r for r, _ in REPORTS + SEPARATE_REPORTS)
             sys.exit(f"ERROR: unknown report '{wanted}'. Choose one of: {names}")
-    cfg = load_config()
+    accounts = {REPORT_ACCOUNT.get(r, "") for r, _ in reports}
+    if len(accounts) > 1:
+        sys.exit("ERROR: these reports use different MSD logins - run them separately.")
+    cfg = load_config(accounts.pop())
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     log(f"User: {cfg['email']}")
@@ -665,20 +825,33 @@ def login(p, cfg: dict):
 def report_worker(cfg: dict, report: str, kind: str, from_date: date, to_date: date, run_dir: Path,
                   failed: list[str]) -> None:
     """Runs in its own thread: own Playwright + own browser (Playwright isn't shared across threads)."""
-    context = None
     try:
         with sync_playwright() as p:
-            try:
-                context = login(p, cfg)
-                run_report(context, current_page(context), report, kind, from_date, to_date, run_dir)
-            except Exception as e:
-                log(f"FAILED: {str(e).splitlines()[0][:200]}")
-                if context is not None:
-                    save_error_screenshot(context)
-                failed.append(report)
-            finally:
-                if context is not None:
-                    close_browser(context)  # this report is done; the others keep running
+            for attempt in range(1, EXPORT_TRIES + 1):
+                context = None
+                try:
+                    context = login(p, cfg)
+                    run_report(context, current_page(context), report, kind, from_date, to_date, run_dir)
+                    return
+                except ExportLinkExpired as e:
+                    log(f"{e} Attempt {attempt} of {EXPORT_TRIES}.")
+                    if context is not None:
+                        save_error_screenshot(context)
+                    if attempt == EXPORT_TRIES:
+                        log("FAILED: the export is too slow for MSD's download link - try again later, "
+                            "when MSD is less busy, and run this report on its own.")
+                        failed.append(report)
+                    else:
+                        log("Starting the export again")
+                except Exception as e:
+                    log(f"FAILED: {str(e).splitlines()[0][:200]}")
+                    if context is not None:
+                        save_error_screenshot(context)
+                    failed.append(report)
+                    return
+                finally:
+                    if context is not None:
+                        close_browser(context)  # this report is done; the others keep running
     except Exception as e:
         log(f"FAILED: could not start Playwright ({str(e).splitlines()[0][:150]})")
         failed.append(report)
