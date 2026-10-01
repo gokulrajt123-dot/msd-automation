@@ -33,6 +33,5 @@ if not exist ".env" (
     notepad ".env"
 )
 
-echo Starting MSD Automation...
 ".venv\Scripts\python.exe" msd_bot.py
 if errorlevel 1 pause

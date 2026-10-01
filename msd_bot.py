@@ -1,9 +1,12 @@
 """MSD (Dynamics 365 Finance and Operations) automation.
 
-Logs in, then downloads reports into downloads/<today>/<report name>/.
+Logs in, then downloads reports one by one into downloads/<today>/Reports/<report>/ and
+downloads/<today>/Stock/<Vehicle|Spares|GMA|Gears>/.
 Period: 1st of this month to today; when run on the 1st, the whole previous month.
-Run with --today to download only today's data (quick test).
-Run with --report "Sales register" to download just that one report (see SEPARATE_REPORTS).
+
+  msd_bot.py                  menu (order, how often, auto-start, download now) - see msd_menu.py
+  msd_bot.py --scheduled      download today's scheduled reports (used by auto-start)
+  msd_bot.py --report "Sales register" [--report ...] [--today]   download these reports now
 
 Login flow:
   1. Microsoft login   -> enter email, Next
@@ -14,8 +17,8 @@ Login flow:
 The script checks which screen is showing and handles it, so it still works
 if a step is skipped (e.g. the saved login is still valid).
 
-Logs in once, then downloads all reports at the same time, each in its own browser window.
-Each browser is a fresh temporary one; only the login cookies are kept (sessions/<user>.json).
+Downloads one report at a time (several big exports at once made MSD time out), each in a
+fresh temporary browser; only the login cookies are kept (sessions/<user>.json).
 A reused browser profile made Chrome crash every time an automated download finished.
 """
 
@@ -25,6 +28,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,8 +44,15 @@ LOG_DIR = BASE_DIR / "logs"
 # Dynamics 365 Finance & Operations home page. (NOT royalenfieldpos... - that is Store Commerce/POS.)
 DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
 
-# Reports to download, in order: (name as shown on the tile in the Reports workspace, kind).
-# Each one is saved to downloads/<run date>/<report name>/. To add a report, add a line here.
+@dataclass(frozen=True)
+class Report:
+    name: str     # the tile's name in MSD (and the report's name in the menu)
+    kind: str     # how it is downloaded, see below
+    folder: str   # where it is saved, under downloads/<date>/
+    account: str = ""  # "" = main login; "PARTS" = PARTS_EMAIL / PARTS_USERNAME / PARTS_PASSWORD in .env
+
+
+# All reports, in the default order (the menu lets the user change order and how often each runs).
 # Kinds:
 #   "ssrs" - dates dialog -> OK -> report shown on screen -> Export -> Excel
 #   "grid" - page with From/To date -> Office icon -> Export to Excel: <report> -> Download
@@ -49,33 +60,23 @@ DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
 #   "list:<home tile>" - home tile (e.g. Part) -> tile with the report's name -> Office icon -> Export to Excel
 #              -> Download (no dates: the whole list is exported). "list:<home tile>><tile>" when the tile's
 #              name differs from the report's (e.g. three workspaces each have a "Stock Report" tile).
-#   "tilldate" - dialog with only a Till date (= end of the period) -> OK -> Download
+#   "tilldate" - dialog with only a Till date (= today) -> OK -> Download
 REPORTS = [
-    ("Job Card Invoice Statement", "ssrs"),
-    ("Booking statement", "grid"),
-    ("Invoice statement", "grid"),
+    Report("Job Card Invoice Statement", "ssrs", "Reports/Job Card Invoice Statement"),
+    Report("Booking statement", "grid", "Reports/Booking statement"),
+    Report("Invoice statement", "grid", "Reports/Invoice statement"),
+    Report("Sales register", "grid", "Reports/Sales register"),
+    Report("Purchase register", "grid", "Reports/Purchase register"),
+    Report("Return Invoice Statement", "grid", "Reports/Return Invoice Statement"),
+    Report("Cancelled booking statement", "grid+generate", "Reports/Cancelled booking statement"),
+    Report("Service claim report", "grid+generate", "Reports/Service claim report", "PARTS"),
+    Report("REAssure Incentive Claims", "list:Part>Claims", "Reports/REAssure Incentive Claims", "PARTS"),
+    Report("Vehicle Stock Ageing", "tilldate", "Stock/Vehicle"),
+    Report("Parts stock", "list:Part>Stock Report", "Stock/Spares", "PARTS"),  # slow: 15+ min
+    Report("GMA stock", "list:GMA>Stock Report", "Stock/GMA"),
+    Report("Gear stock", "list:Gear>Stock Report", "Stock/Gears"),
 ]
-
-# Reports that run on their own (not with the ones above): msd_bot.py --report "Sales register"
-SEPARATE_REPORTS = [
-    ("Sales register", "grid"),
-    ("Purchase register", "grid"),
-    ("Return Invoice Statement", "grid"),
-    ("Vehicle Stock Ageing", "tilldate"),
-    ("Cancelled booking statement", "grid+generate"),
-    ("REAssure Incentive Claims", "list:Part>Claims"),  # all claims (~5 years) - a very big download
-    ("Parts stock", "list:Part>Stock Report"),
-    ("GMA stock", "list:GMA>Stock Report"),
-    ("Gear stock", "list:Gear>Stock Report"),
-    ("Service claim report", "grid+generate"),
-]
-
-# Reports that log in with a different MSD account (.env: <ACCOUNT>_EMAIL, _USERNAME, _PASSWORD).
-REPORT_ACCOUNT = {
-    "REAssure Incentive Claims": "PARTS",
-    "Parts stock": "PARTS",
-    "Service claim report": "PARTS",
-}
+REPORTS_BY_NAME = {r.name.lower(): r for r in REPORTS}
 
 # Very big whole-list exports: count the rows afterwards and ask the user to check the file is complete.
 CHECK_COMPLETE = {"REAssure Incentive Claims"}
@@ -442,9 +443,9 @@ def set_date(page: Page, label: str, value: date) -> None:
     log(f"{label} = {text}")
 
 
-def run_report(context, page: Page, report_name: str, kind: str, from_date: date, to_date: date,
-               run_dir: Path) -> Path:
-    """Open the report, fill the dates, export to Excel and save it in run_dir/<report name>/."""
+def run_report(context, page: Page, report: Report, from_date: date, to_date: date, run_dir: Path) -> Path:
+    """Open the report, fill the dates, export to Excel and save it in run_dir/<report.folder>/."""
+    report_name, kind = report.name, report.kind
     if kind.startswith("list:"):
         home_tile, _, tile = kind.split(":", 1)[1].partition(">")
         open_list_page(page, home_tile, tile or report_name)
@@ -489,7 +490,7 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
 
     wait_long(context, started, "Excel download", downloaded, restart_on_reconnect=True)
 
-    target_dir = run_dir / report_name.strip(" .")
+    target_dir = run_dir / report.folder
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloads[0]
     ext = Path(dl.suggested_filename).suffix or ".xlsx"
@@ -715,84 +716,100 @@ def wait_long(context, started: float, what: str, done, restart_on_reconnect: bo
 
 def report_period(today: date, today_only: bool) -> tuple[date, date]:
     """1st of this month to today. On the 1st of a month: the whole previous month instead.
-    --today (test mode): only today."""
+    today_only (test mode): only today."""
     if today_only:
         return today, today
     if today.day == 1:
-        last_of_prev = today - timedelta(days=1)
-        return last_of_prev.replace(day=1), last_of_prev
+        return previous_month(today)
     return today.replace(day=1), today
 
 
-def main() -> int:
-    today_only = "--today" in sys.argv  # test mode: only today's data (a full month takes 1+ hour)
-    reports = REPORTS
-    if "--report" in sys.argv:  # one named report only, e.g. --report "Sales register"
-        i = sys.argv.index("--report")
-        wanted = sys.argv[i + 1].strip().lower() if i + 1 < len(sys.argv) else ""
-        reports = [r for r in REPORTS + SEPARATE_REPORTS if r[0].strip(" .").lower() == wanted]
-        if not reports:
-            names = ", ".join(r for r, _ in REPORTS + SEPARATE_REPORTS)
-            sys.exit(f"ERROR: unknown report '{wanted}'. Choose one of: {names}")
-    accounts = {REPORT_ACCOUNT.get(r, "") for r, _ in reports}
-    if len(accounts) > 1:
-        sys.exit("ERROR: these reports use different MSD logins - run them separately.")
-    cfg = load_config(accounts.pop())
+def previous_month(today: date) -> tuple[date, date]:
+    last_of_prev = today.replace(day=1) - timedelta(days=1)
+    return last_of_prev.replace(day=1), last_of_prev
+
+
+def log_in_and_save(cfg: dict) -> None:
+    """Log in once in one browser (handles SSO / OTP) and save the login cookies for the report browsers."""
+    with sync_playwright() as p:
+        context = None
+        try:
+            context = login(p, cfg)
+            log(f"Logged in to MSD as {cfg['email']}.")
+            save_session(context, cfg)
+        except Exception:
+            if context is not None:
+                save_error_screenshot(context)
+            raise
+        finally:
+            if context is not None:
+                close_browser(context)
+
+
+def download_reports(jobs: list[tuple[Report, date, date]], on_done=None) -> list[str]:
+    """Download the reports one by one, in the given order: [(report, from date, to date), ...].
+    on_done(report) is called after each successful download. Returns the names that failed."""
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
-    log(f"User: {cfg['email']}")
     for leftover in DOWNLOAD_DIR.glob("*"):  # unfinished downloads from an interrupted run
         if leftover.is_file():
             leftover.unlink(missing_ok=True)
-
-    # 1) Log in once in one browser (handles SSO / OTP) and save the login cookies.
-    try:
-        with sync_playwright() as p:
-            context = None
-            try:
-                context = login(p, cfg)
-                current_page(context).screenshot(path=str(LOG_DIR / "landing_page.png"))
-                log("Logged in to MSD.")
-                save_session(context, cfg)
-            except Exception:
-                if context is not None:
-                    save_error_screenshot(context)
-                raise
-            finally:
-                if context is not None:
-                    close_browser(context)
-    except Exception as e:
-        log(f"FAILED: {e}")
-        input("\nPress Enter to close...")
-        return 1
-
-    today = date.today()
-    from_date, to_date = report_period(today, today_only)
-    log(f"Report period: {from_date:%d-%b-%Y} to {to_date:%d-%b-%Y}")
-    run_dir = DOWNLOAD_DIR / f"{today:%Y-%m-%d}"  # one folder per day, one subfolder per report
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = DOWNLOAD_DIR / f"{date.today():%Y-%m-%d}"  # one folder per day
+    log(f"{len(jobs)} report(s), one by one: {', '.join(r.name for r, _, _ in jobs)}")
     log(f"Saving to {run_dir}")
 
-    # 2) All reports at the same time, each in its own browser (uses the saved login).
+    configs: dict[str, dict | None] = {}  # one login per account, done when first needed
     failed: list[str] = []
-    threads = []
-    for report, kind in reports:
-        t = threading.Thread(target=report_worker, name=report.strip(" ."),
-                             args=(cfg, report, kind, from_date, to_date, run_dir, failed))
+    for n, (report, from_date, to_date) in enumerate(jobs, 1):
+        dated = not (report.kind.startswith("list:") or report.kind == "tilldate")
+        log(f"--- {n}/{len(jobs)}: {report.name}"
+            + (f" ({from_date:%d-%b-%Y} to {to_date:%d-%b-%Y})" if dated else ""))
+        if report.account not in configs:
+            try:
+                cfg = load_config(report.account)
+                log_in_and_save(cfg)
+                configs[report.account] = cfg
+            except (Exception, SystemExit) as e:
+                which = f" with the {report.account} login" if report.account else ""
+                log(f"FAILED to log in{which}: {e}")
+                configs[report.account] = None
+        cfg = configs[report.account]
+        if cfg is None:
+            failed.append(report.name)
+            continue
+        # A thread only so the log lines carry the report's name; the next report waits for it.
+        t = threading.Thread(target=report_worker, name=report.name.strip(" ."),
+                             args=(cfg, report, from_date, to_date, run_dir, failed))
         t.start()
-        threads.append(t)
-        time.sleep(5)  # don't open all browsers in the same second
-    log(f"Started {len(reports)} browser(s): {', '.join(r for r, _ in reports)}")
-    for t in threads:
         t.join()
+        if report.name not in failed and on_done:
+            on_done(report)
 
     if failed:
         log(f"Finished with problems. Not downloaded: {', '.join(failed)}")
-        input("\nPress Enter to close...")
-        return 1
-    log(f"SUCCESS: all {len(reports)} report(s) downloaded to {run_dir}")
+    else:
+        log(f"SUCCESS: all {len(jobs)} report(s) downloaded to {run_dir}")
+    return failed
+
+
+def main() -> int:
+    if "--report" not in sys.argv:
+        import msd_menu  # menu and schedule (kept in a separate file)
+        return msd_menu.main(sys.argv[1:])
+
+    # Command line: --report "Sales register" [--report "Booking statement" ...] [--today]
+    today_only = "--today" in sys.argv  # test mode: only today's data
+    reports = []
+    for i, arg in enumerate(sys.argv):
+        if arg == "--report":
+            wanted = sys.argv[i + 1].strip().lower() if i + 1 < len(sys.argv) else ""
+            if wanted not in REPORTS_BY_NAME:
+                sys.exit(f"ERROR: unknown report '{wanted}'. Choose one of: {', '.join(r.name for r in REPORTS)}")
+            reports.append(REPORTS_BY_NAME[wanted])
+    from_date, to_date = report_period(date.today(), today_only)
+    failed = download_reports([(r, from_date, to_date) for r in reports])
     input("\nPress Enter to close...")
-    return 0
+    return 1 if failed else 0
 
 
 def login(p, cfg: dict):
@@ -826,7 +843,7 @@ def login(p, cfg: dict):
     raise TimeoutError(f"Could not reach the MSD landing page after {LOGIN_ROUNDS} attempts.")
 
 
-def report_worker(cfg: dict, report: str, kind: str, from_date: date, to_date: date, run_dir: Path,
+def report_worker(cfg: dict, report: Report, from_date: date, to_date: date, run_dir: Path,
                   failed: list[str]) -> None:
     """Runs in its own thread: own Playwright + own browser (Playwright isn't shared across threads)."""
     try:
@@ -835,7 +852,7 @@ def report_worker(cfg: dict, report: str, kind: str, from_date: date, to_date: d
                 context = None
                 try:
                     context = login(p, cfg)
-                    run_report(context, current_page(context), report, kind, from_date, to_date, run_dir)
+                    run_report(context, current_page(context), report, from_date, to_date, run_dir)
                     return
                 except ExportLinkExpired as e:
                     log(f"{e} Attempt {attempt} of {EXPORT_TRIES}.")
@@ -844,21 +861,21 @@ def report_worker(cfg: dict, report: str, kind: str, from_date: date, to_date: d
                     if attempt == EXPORT_TRIES:
                         log("FAILED: the export is too slow for MSD's download link - try again later, "
                             "when MSD is less busy, and run this report on its own.")
-                        failed.append(report)
+                        failed.append(report.name)
                     else:
                         log("Starting the export again")
                 except Exception as e:
                     log(f"FAILED: {str(e).splitlines()[0][:200]}")
                     if context is not None:
                         save_error_screenshot(context)
-                    failed.append(report)
+                    failed.append(report.name)
                     return
                 finally:
                     if context is not None:
                         close_browser(context)  # this report is done; the others keep running
     except Exception as e:
         log(f"FAILED: could not start Playwright ({str(e).splitlines()[0][:150]})")
-        failed.append(report)
+        failed.append(report.name)
 
 
 if __name__ == "__main__":

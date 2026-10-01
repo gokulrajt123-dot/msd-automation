@@ -5,3 +5,5 @@ sessions/
 downloads/
 logs/
 __pycache__/
+settings.json
+schedule_state.json
