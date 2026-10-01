@@ -45,6 +45,8 @@ DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
 # Kinds:
 #   "ssrs" - dates dialog -> OK -> report shown on screen -> Export -> Excel
 #   "grid" - page with From/To date -> Office icon -> Export to Excel: <report> -> Download
+#   "grid+generate" - same as "grid", but press Generate after the dates
+#   "tilldate" - dialog with only a Till date (= end of the period) -> OK -> Download
 REPORTS = [
     ("Job Card Invoice Statement", "ssrs"),
     ("Booking statement", "grid"),
@@ -56,6 +58,8 @@ SEPARATE_REPORTS = [
     ("Sales register", "grid"),
     ("Purchase register", "grid"),
     ("Return Invoice Statement", "grid"),
+    ("Vehicle Stock Ageing", "tilldate"),
+    ("Cancelled booking statement", "grid+generate"),
 ]
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
@@ -319,7 +323,7 @@ def click_when_ready(page: Page, locator, what: str, tries: int = 5) -> None:
             page.wait_for_timeout(3000)
 
 
-def open_report_dialog(page: Page, report_name: str) -> None:
+def open_report_dialog(page: Page, report_name: str, first_field: str = "From Date") -> None:
     log("Opening Reports workspace")
     if "PwCReportWorkspaceMenuItem" not in page.url:
         tile = page.locator(".tile-text, [class*='tile']").get_by_text("Reports", exact=True).locator("visible=true").first
@@ -337,7 +341,7 @@ def open_report_dialog(page: Page, report_name: str) -> None:
     if not tile.count():
         raise RuntimeError(f"No tile named '{report_name}' in the Reports workspace.")
     click_when_ready(page, tile, report_name)
-    date_field(page, "From Date").wait_for(state="visible", timeout=120_000)
+    date_field(page, first_field).wait_for(state="visible", timeout=120_000)
     wait_until_idle(page)
 
 
@@ -365,9 +369,14 @@ def set_date(page: Page, label: str, value: date) -> None:
 def run_report(context, page: Page, report_name: str, kind: str, from_date: date, to_date: date,
                run_dir: Path) -> Path:
     """Open the report, fill the dates, export to Excel and save it in run_dir/<report name>/."""
-    open_report_dialog(page, report_name)
-    set_date(page, "From Date", from_date)
-    set_date(page, "To Date", to_date)
+    if kind == "tilldate":
+        open_report_dialog(page, report_name, "Till date")
+        to_date = date.today()  # stock as on today, also on the 1st of the month
+        set_date(page, "Till date", to_date)
+    else:
+        open_report_dialog(page, report_name)
+        set_date(page, "From Date", from_date)
+        set_date(page, "To Date", to_date)
 
     downloads = []
     for pg in context.pages:
@@ -375,8 +384,15 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
     context.on("page", lambda pg: pg.on("download", lambda d: downloads.append(d)))
 
     started = time.time()
-    if kind == "grid":
+    if kind.startswith("grid"):
+        if kind == "grid+generate":
+            log("Pressing Generate")
+            generate = page.get_by_role("button", name=re.compile(r"^\s*Generate\s*$", re.I)).locator("visible=true").first
+            click_when_ready(page, generate, "Generate")
+            wait_until_idle(page, REPORT_TIMEOUT_SEC * 1000)
         export_grid(context, page, report_name, started)
+    elif kind == "tilldate":
+        export_tilldate(context, page, started, downloads)
     else:
         export_ssrs(context, page, from_date, to_date, started)
 
@@ -388,7 +404,8 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloads[0]
     ext = Path(dl.suggested_filename).suffix or ".xlsx"
-    name = f"{report_name.strip(' .')} {from_date:%d-%m-%Y} to {to_date:%d-%m-%Y}{ext}"
+    period = f"till {to_date:%d-%m-%Y}" if kind == "tilldate" else f"{from_date:%d-%m-%Y} to {to_date:%d-%m-%Y}"
+    name = f"{report_name.strip(' .')} {period}{ext}"
     target = unique_path(target_dir / name)  # never overwrite an earlier download
     log(f"Download started ({dl.suggested_filename}) - saving...")
     dl.save_as(str(target))  # waits for the download to finish, however long it takes
@@ -448,6 +465,29 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
     except Exception:
         raise RuntimeError("The 'Export to Excel' panel with the Download button did not open.")
     click_when_ready(page, download_btn, "Download")
+
+
+def export_tilldate(context, page: Page, started: float, downloads: list) -> None:
+    """Press OK; MSD then downloads the file, or shows a Download button to click."""
+    # Only the Till date is changed; Dealer/Zone/Region stay empty (= all).
+    ok = page.get_by_role("button", name=re.compile(r"^\s*OK\s*$")).locator("visible=true").last
+    log("Pressing OK")
+    click_when_ready(page, ok, "OK")
+
+    download_re = re.compile(r"^\W*Download\s*$", re.I)
+
+    def download_or_button() -> bool:
+        if downloads:
+            return True
+        btn = current_page(context).locator("button, [role='button'], a").filter(
+            has_text=download_re).locator("visible=true")
+        if btn.count():
+            log("Clicking 'Download'")
+            click_when_ready(current_page(context), btn.first, "Download")
+            return True
+        return False
+
+    wait_long(context, started, "Download button", download_or_button)
 
 
 def export_ssrs(context, page: Page, from_date: date, to_date: date, started: float) -> None:
