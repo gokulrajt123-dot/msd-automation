@@ -3,6 +3,7 @@
 Logs in, then downloads reports into downloads/<today>/<report name>/.
 Period: 1st of this month to today; when run on the 1st, the whole previous month.
 Run with --today to download only today's data (quick test).
+Run with --report "Sales register" to download just that one report (see SEPARATE_REPORTS).
 
 Login flow:
   1. Microsoft login   -> enter email, Next
@@ -48,6 +49,11 @@ REPORTS = [
     ("Job Card Invoice Statement", "ssrs"),
     ("Booking statement", "grid"),
     ("Invoice statement", "grid"),
+]
+
+# Reports that run on their own (not with the ones above): msd_bot.py --report "Sales register"
+SEPARATE_REPORTS = [
+    ("Sales register", "grid"),
 ]
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
@@ -405,14 +411,19 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
     heading = page.get_by_text(re.compile(r"^\s*Export to Excel\s*$", re.I)).locator("visible=true").first
     upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     wanted = report_name.strip(" .").lower()
-    item = heading.locator(
+    named = heading.locator(
         f"xpath=following::*[starts-with(translate(normalize-space(.), '{upper}', '{upper.lower()}'), '{wanted}')]"
+    ).locator("visible=true").first
+    # If no item has the report's name, take the first menu item right below the heading.
+    below = heading.locator(
+        "xpath=following::*[self::button or @role='menuitem' or self::a][normalize-space(.)]"
     ).locator("visible=true").first
 
     for attempt in range(1, 6):
         click_when_ready(page, office, "Open in Microsoft Office")
         try:
             heading.wait_for(state="visible", timeout=15_000)
+            item = named if named.count() else below
             log(f"Clicking 'Export to Excel' -> '{item.inner_text(timeout=15_000).strip()}'")
             item.click(timeout=15_000)
             break
@@ -512,6 +523,14 @@ def report_period(today: date, today_only: bool) -> tuple[date, date]:
 
 def main() -> int:
     today_only = "--today" in sys.argv  # test mode: only today's data (a full month takes 1+ hour)
+    reports = REPORTS
+    if "--report" in sys.argv:  # one named report only, e.g. --report "Sales register"
+        i = sys.argv.index("--report")
+        wanted = sys.argv[i + 1].strip().lower() if i + 1 < len(sys.argv) else ""
+        reports = [r for r in REPORTS + SEPARATE_REPORTS if r[0].strip(" .").lower() == wanted]
+        if not reports:
+            names = ", ".join(r for r, _ in REPORTS + SEPARATE_REPORTS)
+            sys.exit(f"ERROR: unknown report '{wanted}'. Choose one of: {names}")
     cfg = load_config()
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
@@ -551,13 +570,13 @@ def main() -> int:
     # 2) All reports at the same time, each in its own browser (uses the saved login).
     failed: list[str] = []
     threads = []
-    for report, kind in REPORTS:
+    for report, kind in reports:
         t = threading.Thread(target=report_worker, name=report.strip(" ."),
                              args=(cfg, report, kind, from_date, to_date, run_dir, failed))
         t.start()
         threads.append(t)
         time.sleep(5)  # don't open all browsers in the same second
-    log(f"Started {len(REPORTS)} browsers: {', '.join(r for r, _ in REPORTS)}")
+    log(f"Started {len(reports)} browser(s): {', '.join(r for r, _ in reports)}")
     for t in threads:
         t.join()
 
@@ -565,7 +584,7 @@ def main() -> int:
         log(f"Finished with problems. Not downloaded: {', '.join(failed)}")
         input("\nPress Enter to close...")
         return 1
-    log(f"SUCCESS: all {len(REPORTS)} report(s) downloaded to {run_dir}")
+    log(f"SUCCESS: all {len(reports)} report(s) downloaded to {run_dir}")
     input("\nPress Enter to close...")
     return 0
 

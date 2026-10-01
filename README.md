@@ -17,6 +17,7 @@ Logs in to MSD (Dynamics 365) and downloads the reports automatically into the `
 - Double-click **`Run MSD Automation.bat`**.
 - Reports are saved in `downloads\<today's date>\`.
 - **`Test - Today Only.bat`** downloads only today's data (quick check).
+- **`Run Sales Register.bat`** downloads the Sales register on its own (`Test - Sales Register Today.bat` = today only).
 
 ## If something goes wrong
 
