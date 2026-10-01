@@ -332,10 +332,11 @@ def save_error_screenshot(context) -> None:
         pass
 
 
-def reconnect_if_needed(page: Page) -> None:
+def reconnect_if_needed(page: Page) -> bool:
     """Answer MSD's pop-ups that stop a long export:
     'It appears you lost network connectivity' -> Reconnect,
     'The operation is taking a long time to process, click Wait ...' -> Wait."""
+    reconnected = False
     for name, msg in (("Reconnect", "MSD lost its connection - clicking Reconnect"),
                       ("Wait", "MSD says the export is taking long - clicking Wait")):
         try:
@@ -344,8 +345,10 @@ def reconnect_if_needed(page: Page) -> None:
                 log(msg)
                 btn.first.click(timeout=10_000)
                 page.wait_for_timeout(3000)
+                reconnected = reconnected or name == "Reconnect"
         except Exception:
             pass
+    return reconnected
 
 
 def wait_until_idle(page: Page, timeout_ms: int = 120_000) -> None:
@@ -484,7 +487,7 @@ def run_report(context, page: Page, report_name: str, kind: str, from_date: date
                                     "(AuthenticationFailed / 'Signature not valid in the specified key time frame').")
         return False
 
-    wait_long(context, started, "Excel download", downloaded)
+    wait_long(context, started, "Excel download", downloaded, restart_on_reconnect=True)
 
     target_dir = run_dir / report_name.strip(" .")
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +606,8 @@ def export_grid(context, page: Page, report_name: str, started: float) -> None:
         .or_(page.get_by_text(download_re))
     ).locator("visible=true").first
     # Big lists (e.g. Parts stock) show "Please wait. We're processing your request" for many minutes first.
-    wait_long(context, started, "'Export to Excel' panel with the Download button", lambda: download_btn.count() > 0)
+    wait_long(context, started, "'Export to Excel' panel with the Download button", lambda: download_btn.count() > 0,
+              restart_on_reconnect=True)
     click_when_ready(page, download_btn, "Download")
 
 
@@ -669,7 +673,7 @@ def export_link_expired(context) -> bool:
     """True if a tab shows the Azure storage 'AuthenticationFailed' page instead of downloading the file."""
     for pg in context.pages:
         try:
-            if not pg.is_closed() and "blob.core.windows.net" in pg.url                     and "AuthenticationFailed" in pg.content():
+            if not pg.is_closed() and "blob.core.windows.net" in pg.url                     and pg.get_by_text("AuthenticationFailed").count():  # count() never waits
                 return True
         except Exception:
             pass
@@ -690,13 +694,13 @@ def minutes(since: float) -> int:
     return int((time.time() - since) // 60)
 
 
-def wait_long(context, started: float, what: str, done) -> None:
+def wait_long(context, started: float, what: str, done, restart_on_reconnect: bool = False) -> None:
     """Wait (up to REPORT_TIMEOUT_SEC since `started`) until done() is true, logging every 5 minutes.
     Waits on any open tab, because MSD closes its own tab after the Excel export."""
     next_note = time.time() + 300
     while not done():
-        if browser_alive(context):
-            reconnect_if_needed(current_page(context))
+        if browser_alive(context) and reconnect_if_needed(current_page(context)) and restart_on_reconnect:
+            raise ExportLinkExpired("MSD lost its connection during the export (the export is lost).")
         if time.time() - started > REPORT_TIMEOUT_SEC:
             raise TimeoutError(f"Gave up waiting for the {what} after {REPORT_TIMEOUT_SEC // 3600} hours.")
         if time.time() >= next_note:
