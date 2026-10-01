@@ -18,6 +18,7 @@ Logs in to MSD (Dynamics 365) and downloads the reports automatically into the `
 - Reports are saved in `downloads\<today's date>\`.
 - **`Test - Today Only.bat`** downloads only today's data (quick check).
 - **`Run Sales Register.bat`** downloads the Sales register on its own (`Test - Sales Register Today.bat` = today only).
+- **`Run Return Invoice Statement.bat`** downloads the Return Invoice Statement on its own (`Test - Return Invoice Statement Today.bat` = today only).
 - **`Run Purchase Register.bat`** downloads the Purchase register on its own (`Test - Purchase Register Today.bat` = today only).
 
 ## If something goes wrong

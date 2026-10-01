@@ -55,6 +55,7 @@ REPORTS = [
 SEPARATE_REPORTS = [
     ("Sales register", "grid"),
     ("Purchase register", "grid"),
+    ("Return Invoice Statement", "grid"),
 ]
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
