@@ -1,0 +1,627 @@
+"""MSD (Dynamics 365 Finance and Operations) automation.
+
+Logs in, then downloads reports into downloads/<today>/<report name>/.
+Period: 1st of this month to today; when run on the 1st, the whole previous month.
+Run with --today to download only today's data (quick test).
+
+Login flow:
+  1. Microsoft login   -> enter email, Next
+  2. Royal Enfield SSO -> enter username + password, Submit
+  3. "Stay signed in?" -> Yes
+  4. D365 F&O home page (Workspaces)
+
+The script checks which screen is showing and handles it, so it still works
+if a step is skipped (e.g. the saved login is still valid).
+
+Logs in once, then downloads all reports at the same time, each in its own browser window.
+Each browser is a fresh temporary one; only the login cookies are kept (sessions/<user>.json).
+A reused browser profile made Chrome crash every time an automated download finished.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+import threading
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlparse
+
+from dotenv import dotenv_values
+from playwright.sync_api import Page, sync_playwright
+
+BASE_DIR = Path(__file__).resolve().parent
+SESSION_DIR = BASE_DIR / "sessions"  # saved login cookies, one file per MSD user
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+LOG_DIR = BASE_DIR / "logs"
+
+# Dynamics 365 Finance & Operations home page. (NOT royalenfieldpos... - that is Store Commerce/POS.)
+DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
+
+# Reports to download, in order: (name as shown on the tile in the Reports workspace, kind).
+# Each one is saved to downloads/<run date>/<report name>/. To add a report, add a line here.
+# Kinds:
+#   "ssrs" - dates dialog -> OK -> report shown on screen -> Export -> Excel
+#   "grid" - page with From/To date -> Office icon -> Export to Excel: <report> -> Download
+REPORTS = [
+    ("Job Card Invoice Statement", "ssrs"),
+    ("Booking statement", "grid"),
+    ("Invoice statement", "grid"),
+]
+
+LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
+LOGIN_ROUNDS = 3
+REPORT_TIMEOUT_SEC = 4 * 60 * 60  # a month of data can take 2+ hours
+
+
+_log_lock = threading.Lock()
+
+
+def worker_tag() -> str:
+    """Name of the report this thread works on ('' for the main thread)."""
+    t = threading.current_thread()
+    return "" if t is threading.main_thread() else t.name
+
+
+def file_tag() -> str:
+    return re.sub(r"[^\w-]+", "_", worker_tag()).strip("_")
+
+
+def log(msg: str) -> None:
+    tag = worker_tag()
+    line = f"[{datetime.now():%H:%M:%S}] " + (f"[{tag}] " if tag else "") + msg
+    with _log_lock:  # the report browsers log at the same time
+        print(line, flush=True)
+        try:  # also keep a log file, so a run can be checked afterwards
+            LOG_DIR.mkdir(exist_ok=True)
+            with open(LOG_DIR / f"run_{datetime.now():%Y-%m-%d}.log", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def load_config() -> dict:
+    env_file = BASE_DIR / ".env"
+    if not env_file.exists() or env_file.stat().st_size == 0:
+        sys.exit("ERROR: .env file is missing or empty. See .env.example for what to put in it.")
+
+    # Read the file directly (not os.environ) so Windows' own USERNAME variable can't interfere.
+    raw = {k.upper(): (v or "").strip() for k, v in dotenv_values(env_file).items()}
+
+    def pick(*keys: str) -> str:
+        return next((raw[k] for k in keys if raw.get(k)), "")
+
+    cfg = {
+        "email": pick("MSD_USERNAME", "USERNAME", "MSD_EMAIL", "EMAIL", "USER"),
+        "password": pick("MSD_PASSWORD", "PASSWORD", "PASS"),
+    }
+    missing = [k for k, v in cfg.items() if not v]
+    if missing:
+        sys.exit(f"ERROR: missing in .env: {', '.join(missing)}. See .env.example.")
+
+    # MSD site: use .env value only if it is a real F&O address (not a login link or the POS site).
+    url = pick("MSD_URL", "URL", "D365_URL", "ADDRESS")
+    host = urlparse(url).netloc.lower()
+    if not host.endswith("dynamics.com") or host.startswith("royalenfieldpos."):
+        if url:
+            log(f"Ignoring address in .env ({host or url[:40]}) - using {DEFAULT_MSD_URL}")
+        url = DEFAULT_MSD_URL
+    cfg["url"] = url
+
+    cfg["sso_user"] = pick("SSO_USERNAME") or cfg["email"].split("@")[0]
+    # Separate saved login per MSD user, so switching ids never reuses someone else's session.
+    cfg["session_file"] = SESSION_DIR / (re.sub(r"[^\w.-]", "_", cfg["sso_user"].lower()) + ".json")
+    if "@" not in cfg["email"]:  # Microsoft login needs the full email
+        cfg["email"] = f"{cfg['email']}@{pick('EMAIL_DOMAIN') or 'rebridge.co.in'}"
+    return cfg
+
+
+def visible(page: Page, selector: str) -> bool:
+    try:
+        return page.locator(selector).first.is_visible()
+    except Exception:
+        return False
+
+
+def on_landing_page(page: Page) -> bool:
+    if "dynamics.com" not in page.url:
+        return False
+    try:
+        return page.get_by_text(re.compile(r"^\s*workspaces\s*$", re.I)).first.is_visible()
+    except Exception:
+        return False
+
+
+class LoginSteps:
+    """Remembers how often / how recently each login step was done, so a step can be
+    repeated when MSD asks to log in again, without hammering it (e.g. wrong password)."""
+
+    COOLDOWN_SEC = 8
+    MAX_TRIES = 5
+
+    def __init__(self) -> None:
+        self.tries: dict[str, int] = {}
+        self.last: dict[str, float] = {}
+
+    def ready(self, step: str) -> bool:
+        if self.tries.get(step, 0) >= self.MAX_TRIES:
+            raise RuntimeError(f"Login step '{step}' repeated {self.MAX_TRIES} times without success.")
+        return time.time() - self.last.get(step, 0) > self.COOLDOWN_SEC
+
+    def done(self, step: str) -> None:
+        self.tries[step] = self.tries.get(step, 0) + 1
+        self.last[step] = time.time()
+
+
+def login_attempt(page: Page, cfg: dict, timeout_sec: int) -> bool:
+    """One pass through the login screens. Returns True once the landing page shows."""
+    steps = LoginSteps()
+    deadline = time.time() + timeout_sec
+    waiting_msg_shown = False
+
+    while time.time() < deadline:
+        if on_landing_page(page):
+            return True
+        url = page.url
+
+        # Microsoft: "Pick an account"
+        if visible(page, "#tilesHolder") and steps.ready("pick account"):
+            log("Choosing account")
+            tile = page.locator("#tilesHolder").get_by_text(cfg["email"], exact=False)
+            (tile.first if tile.count() else page.locator("#otherTile")).click()
+            steps.done("pick account")
+            continue
+
+        # Microsoft: email screen
+        if visible(page, 'input[name="loginfmt"]') and steps.ready("email"):
+            log("Entering Microsoft email")
+            page.fill('input[name="loginfmt"]', cfg["email"])
+            page.click("#idSIButton9")
+            steps.done("email")
+            page.wait_for_timeout(2000)
+            continue
+
+        # Royal Enfield SSO (the page also has hidden decoy fields, so target the real ones by id)
+        if "sso.rebridge.co.in" in url and visible(page, "#password") and steps.ready("sso"):
+            if visible(page, "text=/invalid username or password/i") and steps.tries.get("sso"):
+                raise RuntimeError("SSO says: Invalid username or password. Check .env.")
+            log("Entering SSO username and password")
+            for sel, value in (("#username", cfg["sso_user"]), ("#password", cfg["password"])):
+                box = page.locator(sel)
+                box.click()
+                box.fill("")
+                box.press_sequentially(value, delay=40)  # real keystrokes so the Submit button enables
+            page.click("#login-button")
+            steps.done("sso")
+            page.wait_for_timeout(3000)
+            continue
+
+        # Microsoft: "Stay signed in?"
+        if visible(page, "text=Stay signed in?") and steps.ready("stay signed in"):
+            log("Answering 'Stay signed in?' -> Yes")
+            if visible(page, "#KmsiCheckboxField"):
+                page.check("#KmsiCheckboxField")
+            page.click("#idSIButton9")
+            steps.done("stay signed in")
+            page.wait_for_timeout(2000)
+            continue
+
+        # Microsoft: other confirm screens (permissions "Accept", "Continue", ...)
+        if "login.microsoftonline.com" in url and visible(page, "#idSIButton9") and steps.ready("confirm"):
+            label = page.locator("#idSIButton9").first
+            text = (label.get_attribute("value") or label.inner_text() or "").strip()
+            log(f"Confirming Microsoft screen -> '{text}'")
+            label.click()
+            steps.done("confirm")
+            page.wait_for_timeout(2000)
+            continue
+
+        # Anything else (loading, approval on phone, OTP, ...): wait so the user can finish it.
+        if "dynamics.com" not in url and not waiting_msg_shown:
+            log(">> If an approval / OTP is shown, please complete it in the browser. Waiting...")
+            waiting_msg_shown = True
+        page.wait_for_timeout(1000)
+
+    return False
+
+
+def launch_browser(p, cfg: dict):
+    """Start a fresh browser (Playwright's Chromium; else installed Chrome, then Edge) with the
+    saved login cookies of this user, if any."""
+    state = cfg["session_file"] if cfg["session_file"].exists() else None
+    for channel in (None, "chrome", "msedge"):  # None = Playwright's bundled Chromium
+        try:
+            browser = p.chromium.launch(
+                channel=channel,
+                headless=False,
+                chromium_sandbox=True,  # avoids the "--no-sandbox" warning bar
+                downloads_path=str(DOWNLOAD_DIR),
+                args=["--start-maximized"],
+            )
+            context = browser.new_context(storage_state=state, accept_downloads=True, no_viewport=True)
+            context.new_page()
+            log(f"Browser started ({channel or 'chromium'}{', saved login loaded' if state else ''})")
+            return context
+        except Exception as e:
+            log(f"Could not start {channel or 'chromium'}: {str(e).splitlines()[0][:200]}")
+    raise RuntimeError("No browser could be started (Chromium, Chrome or Edge).")
+
+
+def save_session(context, cfg: dict) -> None:
+    """Keep the login cookies so the next run can skip the login screens."""
+    try:
+        SESSION_DIR.mkdir(exist_ok=True)
+        context.storage_state(path=str(cfg["session_file"]))
+    except Exception as e:
+        log(f"Could not save login for next time: {str(e).splitlines()[0][:150]}")
+
+
+def close_browser(context) -> None:
+    try:
+        context.close()
+        context.browser.close()
+    except Exception:
+        pass
+
+
+def browser_alive(context) -> bool:
+    return context is not None and context.browser is not None and context.browser.is_connected()
+
+
+def current_page(context) -> Page:
+    """The page to work on: the most recent open tab."""
+    pages = [pg for pg in context.pages if not pg.is_closed()]
+    return pages[-1] if pages else context.new_page()
+
+
+def any_open_page(context) -> Page:
+    """An open tab to wait on (MSD may close its own tab after the Excel export)."""
+    if not browser_alive(context):
+        raise RuntimeError("The browser was closed.")
+    return current_page(context)
+
+
+def save_error_screenshot(context) -> None:
+    shot = LOG_DIR / f"error_{datetime.now():%Y%m%d_%H%M%S}{'_' + file_tag() if file_tag() else ''}.png"
+    try:
+        current_page(context).screenshot(path=str(shot))
+        log(f"Screenshot saved: {shot}")
+    except Exception:
+        pass
+
+
+def wait_until_idle(page: Page, timeout_ms: int = 120_000) -> None:
+    """D365 shows a transparent 'please wait' layer while busy; clicks during that time are lost."""
+    page.locator("#ShellBlockingDiv").wait_for(state="hidden", timeout=timeout_ms)
+    page.wait_for_timeout(500)
+
+
+def click_when_ready(page: Page, locator, what: str, tries: int = 5) -> None:
+    for attempt in range(1, tries + 1):
+        try:
+            wait_until_idle(page, 30_000)
+            locator.scroll_into_view_if_needed(timeout=30_000)
+            locator.click(timeout=30_000, force=attempt == tries)  # last try: click even if covered
+            return
+        except Exception as e:
+            if attempt == tries:
+                raise RuntimeError(f"Could not click '{what}': {str(e).splitlines()[0][:150]}")
+            log(f"'{what}' not clickable yet - retrying ({attempt}/{tries})")
+            page.wait_for_timeout(3000)
+
+
+def open_report_dialog(page: Page, report_name: str) -> None:
+    log("Opening Reports workspace")
+    if "PwCReportWorkspaceMenuItem" not in page.url:
+        tile = page.locator(".tile-text, [class*='tile']").get_by_text("Reports", exact=True).locator("visible=true").first
+        click_when_ready(page, tile, "Reports")
+        page.wait_for_url(re.compile("PwCReportWorkspaceMenuItem"), timeout=120_000)
+    wait_until_idle(page)
+
+    log(f"Opening '{report_name}'")
+    # visible=true: MSD keeps hidden copies of earlier opened pages with the same tiles
+    tiles = page.locator(".tile-text").locator("visible=true")
+    tiles.first.wait_for(state="visible", timeout=120_000)
+    # Exact name first, so "Booking statement" doesn't open "Cancelled booking statement" etc.
+    exact = tiles.filter(has_text=re.compile(rf"^\s*{re.escape(report_name)}\s*\.?\s*$", re.I))
+    tile = exact.first if exact.count() else tiles.filter(has_text=re.compile(re.escape(report_name), re.I)).first
+    if not tile.count():
+        raise RuntimeError(f"No tile named '{report_name}' in the Reports workspace.")
+    click_when_ready(page, tile, report_name)
+    date_field(page, "From Date").wait_for(state="visible", timeout=120_000)
+    wait_until_idle(page)
+
+
+def date_field(page: Page, label: str):
+    """Input for a label, e.g. 'From Date' / 'From date' (inputs point to their label via aria-labelledby)."""
+    label_el = page.locator("[id$='_label']", has_text=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)).first
+    label_el.wait_for(state="attached", timeout=120_000)
+    return page.locator(f"input[aria-labelledby='{label_el.get_attribute('id')}']")
+
+
+def set_date(page: Page, label: str, value: date) -> None:
+    text = f"{value.month}/{value.day}/{value.year}"  # D365 shows dates as M/D/YYYY
+    box = date_field(page, label)
+    box.click()
+    box.press("Control+a")
+    box.press_sequentially(text, delay=30)
+    box.press("Tab")
+    wait_until_idle(page)
+    shown = box.input_value()
+    if shown != text:
+        raise RuntimeError(f"{label}: typed {text} but MSD shows '{shown}' (date format differs?)")
+    log(f"{label} = {text}")
+
+
+def run_report(context, page: Page, report_name: str, kind: str, from_date: date, to_date: date,
+               run_dir: Path) -> Path:
+    """Open the report, fill the dates, export to Excel and save it in run_dir/<report name>/."""
+    open_report_dialog(page, report_name)
+    set_date(page, "From Date", from_date)
+    set_date(page, "To Date", to_date)
+
+    downloads = []
+    for pg in context.pages:
+        pg.on("download", lambda d: downloads.append(d))
+    context.on("page", lambda pg: pg.on("download", lambda d: downloads.append(d)))
+
+    started = time.time()
+    if kind == "grid":
+        export_grid(context, page, report_name, started)
+    else:
+        export_ssrs(context, page, from_date, to_date, started)
+
+    # Wait for the Excel file.
+    log("Excel export requested - waiting for the download")
+    wait_long(context, started, "Excel download", lambda: bool(downloads))
+
+    target_dir = run_dir / report_name.strip(" .")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dl = downloads[0]
+    ext = Path(dl.suggested_filename).suffix or ".xlsx"
+    name = f"{report_name.strip(' .')} {from_date:%d-%m-%Y} to {to_date:%d-%m-%Y}{ext}"
+    target = unique_path(target_dir / name)  # never overwrite an earlier download
+    log(f"Download started ({dl.suggested_filename}) - saving...")
+    dl.save_as(str(target))  # waits for the download to finish, however long it takes
+    any_open_page(context).wait_for_timeout(3000)  # small pause before moving on / closing
+    log(f"Downloaded in {minutes(started)} min: {target}")
+    return target
+
+
+def export_grid(context, page: Page, report_name: str, started: float) -> None:
+    """Office icon -> EXPORT TO EXCEL: <report> -> Download (right after the dates; no Generate)."""
+    # Only the dates are changed; Zone/Region/Dealer code stay empty (= all).
+    wait_until_idle(page)
+    log("Exporting to Excel")
+
+    # The Office icon in the page toolbar ("Open in Microsoft Office").
+    office = page.locator(
+        "button[id$='SystemDefinedOfficeButton'], button[name='SystemDefinedOfficeButton'], "
+        "button[aria-label*='Microsoft Office' i], button[title*='Microsoft Office' i]"
+    ).locator("visible=true").first
+    # The menu item right below the "EXPORT TO EXCEL" heading with the report's name
+    # (the page title has the same text, so search only after the heading).
+    heading = page.get_by_text(re.compile(r"^\s*Export to Excel\s*$", re.I)).locator("visible=true").first
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    wanted = report_name.strip(" .").lower()
+    item = heading.locator(
+        f"xpath=following::*[starts-with(translate(normalize-space(.), '{upper}', '{upper.lower()}'), '{wanted}')]"
+    ).locator("visible=true").first
+
+    for attempt in range(1, 6):
+        click_when_ready(page, office, "Open in Microsoft Office")
+        try:
+            heading.wait_for(state="visible", timeout=15_000)
+            log(f"Clicking 'Export to Excel' -> '{item.inner_text(timeout=15_000).strip()}'")
+            item.click(timeout=15_000)
+            break
+        except Exception:
+            if attempt == 5:
+                raise RuntimeError(f"The Office menu did not show 'Export to Excel: {report_name}'.")
+            log("Office menu not ready - trying again")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(5000)
+
+    # Side panel "Export to Excel" -> Download
+    # Matched by its text; the button's accessible name isn't just "Download".
+    download_re = re.compile(r"^\W*Download\s*$", re.I)
+    download_btn = (
+        page.locator("button, [role='button'], a").filter(has_text=download_re)
+        .or_(page.get_by_text(download_re))
+    ).locator("visible=true").first
+    try:
+        download_btn.wait_for(state="visible", timeout=120_000)
+    except Exception:
+        raise RuntimeError("The 'Export to Excel' panel with the Download button did not open.")
+    click_when_ready(page, download_btn, "Download")
+
+
+def export_ssrs(context, page: Page, from_date: date, to_date: date, started: float) -> None:
+    """Press OK, wait for the report on screen, then Export -> Excel."""
+    # Only the dates are changed; Zone/Region/ASM/Dealer stay as MSD fills them.
+    ok = page.locator("button[id$='_CommandButton']:visible").first  # the dialog's OK button
+    log("Pressing OK")
+    click_when_ready(page, ok, "OK")
+    log(f"OK pressed - MSD is building the report ({from_date:%d-%b-%Y} to {to_date:%d-%b-%Y}). "
+        "A full month can take 2+ hours; keep this window open.")
+
+    # 1) Wait until the report is shown on screen (its toolbar has an "Export" button).
+    export_btn = page.locator("button:visible, [role='button']:visible, [role='menuitem']:visible").filter(
+        has_text=re.compile(r"^\s*Export\s*$")).first
+    wait_long(context, started, "report to appear on screen", lambda: export_btn.count() > 0)
+    log(f"Report is on screen after {minutes(started)} min - exporting to Excel")
+
+    # 2) Export -> Excel (retry if the menu doesn't open yet).
+    excel_item = page.get_by_text("Excel", exact=True).locator("visible=true").first
+    for attempt in range(1, 6):
+        click_when_ready(page, export_btn, "Export")
+        try:
+            excel_item.wait_for(state="visible", timeout=15_000)
+            excel_item.click()
+            break
+        except Exception:
+            if attempt == 5:
+                raise RuntimeError("The Export menu did not show the 'Excel' option.")
+            log("Export menu not ready - trying again")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(5000)
+
+
+def unique_path(path: Path) -> Path:
+    """'file.xlsx' -> 'file (2).xlsx', 'file (3).xlsx', ... if the name is already taken."""
+    n = 2
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return candidate
+
+
+def minutes(since: float) -> int:
+    return int((time.time() - since) // 60)
+
+
+def wait_long(context, started: float, what: str, done) -> None:
+    """Wait (up to REPORT_TIMEOUT_SEC since `started`) until done() is true, logging every 5 minutes.
+    Waits on any open tab, because MSD closes its own tab after the Excel export."""
+    next_note = time.time() + 300
+    while not done():
+        if time.time() - started > REPORT_TIMEOUT_SEC:
+            raise TimeoutError(f"Gave up waiting for the {what} after {REPORT_TIMEOUT_SEC // 3600} hours.")
+        if time.time() >= next_note:
+            log(f"Still waiting for the {what}... {minutes(started)} min so far")
+            next_note += 300
+            try:
+                current_page(context).screenshot(path=str(LOG_DIR / f"progress_{file_tag() or 'main'}.png"))
+            except Exception:
+                pass
+        any_open_page(context).wait_for_timeout(5000)
+
+
+def report_period(today: date, today_only: bool) -> tuple[date, date]:
+    """1st of this month to today. On the 1st of a month: the whole previous month instead.
+    --today (test mode): only today."""
+    if today_only:
+        return today, today
+    if today.day == 1:
+        last_of_prev = today - timedelta(days=1)
+        return last_of_prev.replace(day=1), last_of_prev
+    return today.replace(day=1), today
+
+
+def main() -> int:
+    today_only = "--today" in sys.argv  # test mode: only today's data (a full month takes 1+ hour)
+    cfg = load_config()
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
+    log(f"User: {cfg['email']}")
+    for leftover in DOWNLOAD_DIR.glob("*"):  # unfinished downloads from an interrupted run
+        if leftover.is_file():
+            leftover.unlink(missing_ok=True)
+
+    # 1) Log in once in one browser (handles SSO / OTP) and save the login cookies.
+    try:
+        with sync_playwright() as p:
+            context = None
+            try:
+                context = login(p, cfg)
+                current_page(context).screenshot(path=str(LOG_DIR / "landing_page.png"))
+                log("Logged in to MSD.")
+                save_session(context, cfg)
+            except Exception:
+                if context is not None:
+                    save_error_screenshot(context)
+                raise
+            finally:
+                if context is not None:
+                    close_browser(context)
+    except Exception as e:
+        log(f"FAILED: {e}")
+        input("\nPress Enter to close...")
+        return 1
+
+    today = date.today()
+    from_date, to_date = report_period(today, today_only)
+    log(f"Report period: {from_date:%d-%b-%Y} to {to_date:%d-%b-%Y}")
+    run_dir = DOWNLOAD_DIR / f"{today:%Y-%m-%d}"  # one folder per day, one subfolder per report
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Saving to {run_dir}")
+
+    # 2) All reports at the same time, each in its own browser (uses the saved login).
+    failed: list[str] = []
+    threads = []
+    for report, kind in REPORTS:
+        t = threading.Thread(target=report_worker, name=report.strip(" ."),
+                             args=(cfg, report, kind, from_date, to_date, run_dir, failed))
+        t.start()
+        threads.append(t)
+        time.sleep(5)  # don't open all browsers in the same second
+    log(f"Started {len(REPORTS)} browsers: {', '.join(r for r, _ in REPORTS)}")
+    for t in threads:
+        t.join()
+
+    if failed:
+        log(f"Finished with problems. Not downloaded: {', '.join(failed)}")
+        input("\nPress Enter to close...")
+        return 1
+    log(f"SUCCESS: all {len(REPORTS)} report(s) downloaded to {run_dir}")
+    input("\nPress Enter to close...")
+    return 0
+
+
+def login(p, cfg: dict):
+    """Open a browser and get to the MSD landing page. Returns the browser context."""
+    context = None
+    for round_no in range(1, LOGIN_ROUNDS + 1):
+        try:
+            # (Re)open the browser if this is the first try or it was closed/crashed.
+            if not browser_alive(context):
+                if context is not None:
+                    log("Browser was closed - opening it again.")
+                    close_browser(context)
+                context = launch_browser(p, cfg)
+
+            page = current_page(context)
+            log(f"Opening {cfg['url']} (attempt {round_no} of {LOGIN_ROUNDS})")
+            page.goto(cfg["url"], wait_until="commit", timeout=120_000)
+            if login_attempt(page, cfg, LOGIN_TIMEOUT_SEC):
+                log("Landing page reached.")
+                return context
+            log("Landing page not reached yet - starting login again.")
+            save_error_screenshot(context)
+        except RuntimeError:
+            if context is not None:
+                close_browser(context)
+            raise  # wrong password etc.: retrying won't help
+        except Exception as e:
+            log(f"Login problem ({str(e).splitlines()[0][:150]}) - starting login again.")
+    if context is not None:
+        close_browser(context)
+    raise TimeoutError(f"Could not reach the MSD landing page after {LOGIN_ROUNDS} attempts.")
+
+
+def report_worker(cfg: dict, report: str, kind: str, from_date: date, to_date: date, run_dir: Path,
+                  failed: list[str]) -> None:
+    """Runs in its own thread: own Playwright + own browser (Playwright isn't shared across threads)."""
+    context = None
+    try:
+        with sync_playwright() as p:
+            try:
+                context = login(p, cfg)
+                run_report(context, current_page(context), report, kind, from_date, to_date, run_dir)
+            except Exception as e:
+                log(f"FAILED: {str(e).splitlines()[0][:200]}")
+                if context is not None:
+                    save_error_screenshot(context)
+                failed.append(report)
+            finally:
+                if context is not None:
+                    close_browser(context)  # this report is done; the others keep running
+    except Exception as e:
+        log(f"FAILED: could not start Playwright ({str(e).splitlines()[0][:150]})")
+        failed.append(report)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
