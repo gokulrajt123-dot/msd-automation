@@ -54,6 +54,7 @@ REPORTS = [
 # Reports that run on their own (not with the ones above): msd_bot.py --report "Sales register"
 SEPARATE_REPORTS = [
     ("Sales register", "grid"),
+    ("Purchase register", "grid"),
 ]
 
 LOGIN_TIMEOUT_SEC = 300  # per attempt; leaves time for manual approvals
