@@ -39,6 +39,17 @@ Everything is done from **one file**: **`Run MSD Automation.bat`**
    PARTS_PASSWORD=  the parts login password
    ```
 
+   **More than one branch?** Instead of the lines above, list the branches and give each its own
+   logins, named after the branch (see `.env.example`):
+
+   ```
+   BRANCHES=Udumalpet, Pollachi
+   UDUMALPET_EMAIL=...   UDUMALPET_PARTS_EMAIL=...   (and _USERNAME / _PASSWORD)
+   POLLACHI_EMAIL=...    POLLACHI_PARTS_EMAIL=...    (and _USERNAME / _PASSWORD)
+   ```
+
+   Every report is then downloaded for each branch, into its own folder.
+
 4. Click **File → Save**, then close Notepad.
 
 ### Step 4: Choose your automatic downloads
@@ -83,6 +94,7 @@ Double-click **`Run MSD Automation.bat`**. You will see a list of reports and th
   H  Change how often some reports download
   A  Automatic download settings
   B  Browser windows: show / hide while downloading
+  P  Send income to Paisa now
   X  Exit
 ```
 
@@ -122,6 +134,13 @@ Switch it **on or off**, and set **how many minutes after switching on the compu
 Normally the downloads happen **invisibly** in the background, so you can keep working.
 Press **B** to see the browser windows while it downloads (useful if something goes wrong).
 Press **B** again to hide them.
+
+### P - Send income to Paisa
+Only if the **Paisa** money app is set up on this computer (`PAISA_DIR` in `.env`, see `.env.example`).
+It adds the income from the **Job Card Invoice Statement** (labour, spares, oil) and the
+**Invoice statement** (vehicles), without GST, as one entry per day per type.
+This also happens **by itself** after those reports download, so you only need **P** to re-send.
+Sending again never doubles anything: a day that grew is just updated.
 
 ### X - Exit
 Closes the menu.

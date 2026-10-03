@@ -73,6 +73,7 @@ REPORTS = [
     Report("Cancelled booking statement", "grid+generate", "Reports/Cancelled booking statement"),
     Report("Service claim report", "grid+generate", "Reports/Service claim report", "PARTS"),
     Report("REAssure Incentive Claims", "list:Part>Claims", "Reports/REAssure Incentive Claims", "PARTS"),
+    Report("RE Assure", "list:Sales", "Reports/RE Assure"),  # landing page Sales tile, not Reports
     Report("Vehicle Stock Ageing", "tilldate", "Stock/Vehicle"),
     Report("Parts stock", "list:Part>Stock Report", "Stock/Spares", "PARTS"),  # slow: 15+ min
     Report("GMA stock", "list:GMA>Stock Report", "Stock/GMA"),
@@ -120,20 +121,37 @@ def log(msg: str) -> None:
             pass
 
 
-def load_config(account: str = "") -> dict:
-    """Login details from .env. account="PARTS" reads PARTS_EMAIL / PARTS_USERNAME / PARTS_PASSWORD."""
+def read_env() -> dict[str, str]:
+    """The .env file as {UPPER-CASE KEY: value}."""
     env_file = BASE_DIR / ".env"
     if not env_file.exists() or env_file.stat().st_size == 0:
         sys.exit("ERROR: .env file is missing or empty. See .env.example for what to put in it.")
-
     # Read the file directly (not os.environ) so Windows' own USERNAME variable can't interfere.
-    raw = {k.upper(): (v or "").strip() for k, v in dotenv_values(env_file).items()}
+    return {k.upper(): (v or "").strip() for k, v in dotenv_values(env_file).items()}
+
+
+def env_key(name: str) -> str:
+    """'Udumalpet' -> 'UDUMALPET' (prefix of that branch's lines in .env)."""
+    return re.sub(r"\W+", "_", name).strip("_").upper()
+
+
+def branches() -> list[str]:
+    """Branches from BRANCHES= in .env, e.g. ['Udumalpet', 'Pollachi'].
+    [''] when not set: one set of logins (EMAIL=, PARTS_EMAIL=, ...) and no branch folder."""
+    names = [b.strip() for b in read_env().get("BRANCHES", "").split(",") if b.strip()]
+    return names or [""]
+
+
+def load_config(account: str = "", branch: str = "") -> dict:
+    """Login details from .env. account="PARTS" reads PARTS_EMAIL / PARTS_USERNAME / PARTS_PASSWORD.
+    branch="Pollachi" reads POLLACHI_EMAIL / ... and POLLACHI_PARTS_EMAIL / ... instead."""
+    raw = read_env()
 
     def pick(*keys: str) -> str:
         return next((raw[k] for k in keys if raw.get(k)), "")
 
-    if account:
-        pre = account.upper() + "_"
+    if account or branch:
+        pre = "".join(env_key(x) + "_" for x in (branch, account) if x)
         cfg = {
             "email": pick(pre + "EMAIL", pre + "USER_ID", pre + "USERNAME"),
             "password": pick(pre + "PASSWORD"),
@@ -145,7 +163,7 @@ def load_config(account: str = "") -> dict:
             "password": pick("MSD_PASSWORD", "PASSWORD", "PASS"),
         }
         sso_user = pick("SSO_USERNAME", "MSD_USERNAME", "USERNAME")
-    missing = [f"{account.upper() + '_' if account else ''}{k.upper()}" for k, v in cfg.items() if not v]
+    missing = [f"{pre if account or branch else ''}{k.upper()}" for k, v in cfg.items() if not v]
     if missing:
         sys.exit(f"ERROR: missing in .env: {', '.join(missing)}. See .env.example.")
 
@@ -775,49 +793,66 @@ def log_in_and_save(cfg: dict) -> None:
                 close_browser(context)
 
 
-def download_reports(jobs: list[tuple[Report, date, date]], on_done=None) -> list[str]:
-    """Download the reports one by one, in the given order: [(report, from date, to date), ...].
-    on_done(report) is called after each successful download. Returns the names that failed."""
+def download_reports(jobs: list[tuple[Report, date, date]], on_done=None, skip=None) -> list[str]:
+    """Download the reports one by one, in the given order: [(report, from date, to date), ...],
+    for every branch in .env (all reports of the first branch, then the next branch).
+    skip(report, branch) -> True leaves that one out (already downloaded today).
+    on_done(report, branch) is called after each successful download.
+    Returns what failed, e.g. ['Pollachi: Sales register']."""
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     for leftover in DOWNLOAD_DIR.glob("*"):  # unfinished downloads from an interrupted run
         if leftover.is_file():
             leftover.unlink(missing_ok=True)
-    run_dir = DOWNLOAD_DIR / f"{date.today():%Y-%m-%d}"  # one folder per day
-    log(f"{len(jobs)} report(s), one by one: {', '.join(r.name for r, _, _ in jobs)}")
-    log(f"Saving to {run_dir}")
+    day_dir = DOWNLOAD_DIR / f"{date.today():%Y-%m-%d}"  # one folder per day, inside it one per branch
+    work = [(branch, *job) for branch in branches() for job in jobs if not (skip and skip(job[0], branch))]
+    log(f"{len(work)} report(s), one by one: "
+        + ", ".join(f"{b}: {r.name}" if b else r.name for b, r, _, _ in work))
+    log(f"Saving to {day_dir}")
 
-    configs: dict[str, dict | None] = {}  # one login per account, done when first needed
+    configs: dict[tuple[str, str], dict | None] = {}  # one login per branch + account, done when first needed
     failed: list[str] = []
-    for n, (report, from_date, to_date) in enumerate(jobs, 1):
+    done: list[tuple[str, Report]] = []
+    for n, (branch, report, from_date, to_date) in enumerate(work, 1):
+        label = f"{branch}: {report.name}" if branch else report.name
         dated = not (report.kind.startswith("list:") or report.kind == "tilldate")
-        log(f"--- {n}/{len(jobs)}: {report.name}"
+        log(f"--- {n}/{len(work)}: {label}"
             + (f" ({from_date:%d-%b-%Y} to {to_date:%d-%b-%Y})" if dated else ""))
-        if report.account not in configs:
+        key = (branch, report.account)
+        if key not in configs:
             try:
-                cfg = load_config(report.account)
+                cfg = load_config(report.account, branch)
                 log_in_and_save(cfg)
-                configs[report.account] = cfg
+                configs[key] = cfg
             except (Exception, SystemExit) as e:
-                which = f" with the {report.account} login" if report.account else ""
-                log(f"FAILED to log in{which}: {e}")
-                configs[report.account] = None
-        cfg = configs[report.account]
+                which = " ".join(x for x in (branch, report.account) if x)
+                log(f"FAILED to log in{f' with the {which} login' if which else ''}: {e}")
+                configs[key] = None
+        cfg = configs[key]
         if cfg is None:
-            failed.append(report.name)
+            failed.append(label)
             continue
         # A thread only so the log lines carry the report's name; the next report waits for it.
-        t = threading.Thread(target=report_worker, name=report.name.strip(" ."),
-                             args=(cfg, report, from_date, to_date, run_dir, failed))
+        problems: list[str] = []
+        t = threading.Thread(target=report_worker, name=label.strip(" ."),
+                             args=(cfg, report, from_date, to_date, day_dir / branch, problems))
         t.start()
         t.join()
-        if report.name not in failed and on_done:
-            on_done(report)
+        if problems:
+            failed.append(label)
+            continue
+        done.append((branch, report))
+        if on_done:
+            on_done(report, branch)
+
+    import msd_income  # income from the job card / vehicle invoices -> Paisa (only if set up in .env)
+    if any(r.name in msd_income.INCOME_REPORTS for _, r in done):
+        msd_income.send_to_paisa()
 
     if failed:
         log(f"Finished with problems. Not downloaded: {', '.join(failed)}")
     else:
-        log(f"SUCCESS: all {len(jobs)} report(s) downloaded to {run_dir}")
+        log(f"SUCCESS: all {len(work)} report(s) downloaded to {day_dir}")
     return failed
 
 

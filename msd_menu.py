@@ -81,28 +81,45 @@ def ordered_reports(s: dict) -> list[bot.Report]:
 
 # ---------- what is due today ----------
 
+def state_key(report: bot.Report, branch: str) -> str:
+    return f"{branch}: {report.name}" if branch else report.name
+
+
+def is_due(sched: str, done: str, today: date) -> bool:
+    """done = the date (ISO) this report was last downloaded for this branch, or ''."""
+    if sched == "daily":
+        return done != today.isoformat()
+    if sched == "month_end":  # once a month, on the first run from the 1st on
+        return done < today.replace(day=1).isoformat()
+    if sched.startswith("days:"):
+        days = {int(d) for d in sched[5:].split(",") if d.strip().isdigit()}
+        return today.day in days and done != today.isoformat()
+    return False
+
+
 def due_jobs(s: dict, today: date) -> list[tuple[bot.Report, date, date]]:
-    """Reports to download today in the user's order, with their period. Skips what was already done."""
+    """Reports to download today in the user's order, with their period: those not yet done for
+    at least one branch. download_reports(skip=not_due(...)) then leaves out the branches already done."""
     last = read_json(STATE_FILE)
     jobs = []
     for report in ordered_reports(s):
         sched = s["schedule"][report.name]
-        done = last.get(report.name, "")
-        if sched == "daily" and done != today.isoformat():
-            jobs.append((report, *bot.report_period(today, False)))
-        elif sched == "month_end" and done < today.replace(day=1).isoformat():
-            # once a month, on the first run from the 1st on: the whole previous month
-            jobs.append((report, *bot.previous_month(today)))
-        elif sched.startswith("days:") and done != today.isoformat():
-            days = {int(d) for d in sched[5:].split(",") if d.strip().isdigit()}
-            if today.day in days:
-                jobs.append((report, *bot.report_period(today, False)))
+        if any(is_due(sched, last.get(state_key(report, b), ""), today) for b in bot.branches()):
+            period = bot.previous_month(today) if sched == "month_end" else bot.report_period(today, False)
+            jobs.append((report, *period))
     return jobs
 
 
-def mark_done(report: bot.Report) -> None:
+def not_due(s: dict, today: date):
+    """skip(report, branch) for download_reports: True when that branch already has it."""
     last = read_json(STATE_FILE)
-    last[report.name] = date.today().isoformat()
+    return lambda report, branch: not is_due(s["schedule"][report.name],
+                                             last.get(state_key(report, branch), ""), today)
+
+
+def mark_done(report: bot.Report, branch: str = "") -> None:
+    last = read_json(STATE_FILE)
+    last[state_key(report, branch)] = date.today().isoformat()
     write_json(STATE_FILE, last)
 
 
@@ -139,7 +156,7 @@ def run_scheduled(s: dict, wait: bool) -> int:
         bot.log("Nothing to download today (all scheduled reports are done or not due).")
         time.sleep(15)
         return 0
-    failed = bot.download_reports(jobs, on_done=mark_done)
+    failed = bot.download_reports(jobs, on_done=mark_done, skip=not_due(s, date.today()))
     if failed:
         input("\nSome reports were not downloaded. Press Enter to close...")
         return 1
@@ -162,6 +179,9 @@ def show(s: dict) -> None:
         print(f"  {i:>2}  {r.name:<30} {folder:<16} {describe(s['schedule'][r.name])}")
     auto = (f"ON - {s['startup_delay_min']} minute(s) after you log in to Windows" if s["autostart"]
             else "OFF")
+    names = [b for b in bot.branches() if b]
+    if names:
+        print(f"\n  Branches (each report is downloaded for each): {', '.join(names)}")
     print(f"\n  Automatic download: {auto}")
     print(f"  Browser windows while downloading: {'SHOWN' if s['show_browser'] else 'HIDDEN'}")
     due = due_jobs(s, date.today())
@@ -174,6 +194,7 @@ def show(s: dict) -> None:
   H  Change how often some reports download
   A  Automatic download settings
   B  Browser windows: show / hide while downloading
+  P  Send income to Paisa now (job card and vehicle invoices)
   X  Exit
 """)
 
@@ -355,7 +376,7 @@ def menu() -> int:
         elif choice == "d":
             jobs = due_jobs(s, date.today())
             if jobs:
-                bot.download_reports(jobs, on_done=mark_done)
+                bot.download_reports(jobs, on_done=mark_done, skip=not_due(s, date.today()))
             else:
                 print("Nothing to download today (all scheduled reports are done or not due).")
             ask("\nPress Enter to go back to the menu...")
@@ -371,6 +392,13 @@ def menu() -> int:
             s["show_browser"] = not s["show_browser"]
             bot.SHOW_BROWSER = s["show_browser"]
             save_settings(s)
+        elif choice == "p":
+            import msd_income
+            if msd_income.paisa_settings()[0] is None:
+                print("Paisa is not set up: add PAISA_DIR to the .env file (see msd_income.py).")
+            else:
+                msd_income.send_to_paisa()
+            ask("\nPress Enter to go back to the menu...")
         elif choice == "x":
             return 0
 
