@@ -57,7 +57,8 @@ class Report:
 # Kinds:
 #   "ssrs" - dates dialog -> OK -> report shown on screen -> Export -> Excel
 #   "grid" - page with From/To date -> Office icon -> Export to Excel: <report> -> Download
-#   "grid+generate" - same as "grid", but press Generate after the dates
+#              (Generate is pressed too when the page has the button - some logins need it)
+#   "grid+generate" - same as "grid", but always press Generate after the dates
 #   "list:<home tile>" - home tile (e.g. Part) -> tile with the report's name -> Office icon -> Export to Excel
 #              -> Download (no dates: the whole list is exported). "list:<home tile>><tile>" when the tile's
 #              name differs from the report's (e.g. three workspaces each have a "Stock Report" tile).
@@ -488,9 +489,11 @@ def run_report(context, page: Page, report: Report, from_date: date, to_date: da
     if kind.startswith("list:"):
         export_grid(context, page, report_name, started)
     elif kind.startswith("grid"):
-        if kind == "grid+generate":
+        # Some logins (e.g. 7230) show a Generate button on every grid report; until it is pressed
+        # the grid stays empty and the export has only the header row.
+        generate = page.get_by_role("button", name=re.compile(r"^\s*Generate\s*$", re.I)).locator("visible=true").first
+        if kind == "grid+generate" or generate.count():
             log("Pressing Generate")
-            generate = page.get_by_role("button", name=re.compile(r"^\s*Generate\s*$", re.I)).locator("visible=true").first
             click_when_ready(page, generate, "Generate")
             wait_until_idle(page, REPORT_TIMEOUT_SEC * 1000)
         export_grid(context, page, report_name, started)
