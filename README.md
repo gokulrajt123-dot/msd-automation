@@ -139,6 +139,8 @@ Press **B** again to hide them.
 Only if the **Paisa** money app is set up on this computer (`PAISA_DIR` in `.env`, see `.env.example`).
 It adds the income from the **Job Card Invoice Statement** (labour, spares, oil) and the
 **Invoice statement** (vehicles), without GST, as one entry per day per type.
+Vehicles go in as **Bike sales** = bikes sold × the margin per bike, which you set (with the
+date it applies from) in Paisa under **Settings → the book → Income rates**.
 This also happens **by itself** after those reports download, so you only need **P** to re-send.
 Sending again never doubles anything: a day that grew is just updated.
 
@@ -149,22 +151,30 @@ Closes the menu.
 
 ## Part 3 - Where are my files?
 
-Open the tool's folder, then **downloads**. There is one folder per day:
+Open the tool's folder, then **downloads**. Reports and stock each have one folder per month,
+and inside it one folder per report:
 
 ```
 downloads
-  └ 2026-10-01
-      ├ Stock
-      │   ├ Vehicle
-      │   ├ Spares
-      │   ├ GMA
-      │   └ Gears
-      └ Reports
-          ├ Booking statement
-          ├ Invoice statement
-          ├ Job Card Invoice Statement
-          └ ... (one folder for each report)
+  ├ Reports
+  │   ├ 2026-09 September
+  │   └ 2026-10 October
+  │       ├ Booking statement
+  │       ├ Invoice statement
+  │       ├ Job Card Invoice Statement
+  │       └ ... (one folder for each report)
+  └ Stock
+      └ 2026-10 October
+          ├ Vehicle
+          ├ Spares
+          ├ GMA
+          └ Gears
 ```
+
+The month is the month of the data: on the 1st, the whole previous month is downloaded,
+so it goes in the previous month's folder. Each file's name has its dates.
+With more than one branch (`BRANCHES=` in `.env`) there is first a folder per branch,
+e.g. `downloads\Pollachi\Reports\2026-10 October\Booking statement`.
 
 Old files are never deleted or replaced.
 

@@ -13,7 +13,9 @@ Runs by itself after a download that included one of these reports, if PAISA_DIR
 Income is without GST: the taxable value minus the dealer's own discount, i.e. what the
 customer (or Royal Enfield, for free service / warranty / AMC coupons) pays the dealer, less GST.
   Job card line:  Basic Amount - Discount(Dealer Value)
-  Vehicle:        Basic price (or Amount - Tax when that is empty); cancelled invoices skipped
+  Vehicle:        Basic price (or Amount - Tax when that is empty); cancelled invoices skipped.
+                  Paisa files vehicles as "Bike sales" = invoices (one bike each) x the per-bike
+                  margin set in Paisa for that date, so only the invoice count matters there.
 
 MSD hands out the same day several times as it fills up (and the files are never deleted),
 so all files are read every time and each invoice is counted once, from the newest file
@@ -128,12 +130,14 @@ def report_files(report: str) -> list[Path]:
 
 
 def branch_of(path: Path) -> str:
-    """The branch a downloaded file belongs to: downloads/<day>/<branch>/... ('' without BRANCHES=).
+    """The branch a downloaded file belongs to: downloads/<branch>/Reports/... ('' without BRANCHES=),
+    or downloads/<day>/<branch>/... in older downloads.
     Files from before BRANCHES= was set have no branch folder; they count for the first branch."""
     names = [b for b in bot.branches() if b]
     parts = path.relative_to(bot.DOWNLOAD_DIR).parts
-    if len(parts) > 1 and parts[1] in names:
-        return parts[1]
+    for part in parts[:2]:
+        if part in names:
+            return part
     return names[0] if names else ""
 
 

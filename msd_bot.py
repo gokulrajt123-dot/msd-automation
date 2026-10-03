@@ -49,7 +49,7 @@ DEFAULT_MSD_URL = "https://royalenfield.operations.dynamics.com/"
 class Report:
     name: str     # the tile's name in MSD (and the report's name in the menu)
     kind: str     # how it is downloaded, see below
-    folder: str   # where it is saved, under downloads/<date>/
+    folder: str   # where it is saved: "Reports/Booking statement" -> downloads/Reports/<month>/Booking statement/
     account: str = ""  # "" = main login; "PARTS" = PARTS_EMAIL / PARTS_USERNAME / PARTS_PASSWORD in .env
 
 
@@ -484,7 +484,8 @@ def set_date(page: Page, label: str, value: date) -> None:
 
 
 def run_report(context, page: Page, report: Report, from_date: date, to_date: date, run_dir: Path) -> Path:
-    """Open the report, fill the dates, export to Excel and save it in run_dir/<report.folder>/."""
+    """Open the report, fill the dates, export to Excel and save it in
+    run_dir/<Reports or Stock>/<month, e.g. 2026-10 October>/<report folder>/."""
     report_name, kind = report.name, report.kind
     if kind.startswith("list:"):
         home_tile, _, tile = kind.split(":", 1)[1].partition(">")
@@ -532,7 +533,10 @@ def run_report(context, page: Page, report: Report, from_date: date, to_date: da
 
     wait_long(context, started, "Excel download", downloaded, restart_on_reconnect=True)
 
-    target_dir = run_dir / report.folder
+    # Month of the data: the From date (the whole previous month on the 1st), else the day of download.
+    top, _, sub = report.folder.partition("/")
+    month = from_date if not (kind.startswith("list:") or kind == "tilldate") else date.today()
+    target_dir = run_dir / top / f"{month:%Y-%m %B}" / sub
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloads[0]
     ext = Path(dl.suggested_filename).suffix or ".xlsx"
@@ -795,7 +799,8 @@ def log_in_and_save(cfg: dict) -> None:
 
 def download_reports(jobs: list[tuple[Report, date, date]], on_done=None, skip=None) -> list[str]:
     """Download the reports one by one, in the given order: [(report, from date, to date), ...],
-    for every branch in .env (all reports of the first branch, then the next branch).
+    for every branch in .env (all reports of the first branch, then the next branch), into
+    downloads/[<branch>/]Reports/<month>/<report>/.
     skip(report, branch) -> True leaves that one out (already downloaded today).
     on_done(report, branch) is called after each successful download.
     Returns what failed, e.g. ['Pollachi: Sales register']."""
@@ -804,11 +809,10 @@ def download_reports(jobs: list[tuple[Report, date, date]], on_done=None, skip=N
     for leftover in DOWNLOAD_DIR.glob("*"):  # unfinished downloads from an interrupted run
         if leftover.is_file():
             leftover.unlink(missing_ok=True)
-    day_dir = DOWNLOAD_DIR / f"{date.today():%Y-%m-%d}"  # one folder per day, inside it one per branch
     work = [(branch, *job) for branch in branches() for job in jobs if not (skip and skip(job[0], branch))]
     log(f"{len(work)} report(s), one by one: "
         + ", ".join(f"{b}: {r.name}" if b else r.name for b, r, _, _ in work))
-    log(f"Saving to {day_dir}")
+    log(f"Saving to {DOWNLOAD_DIR}")
 
     configs: dict[tuple[str, str], dict | None] = {}  # one login per branch + account, done when first needed
     failed: list[str] = []
@@ -835,7 +839,7 @@ def download_reports(jobs: list[tuple[Report, date, date]], on_done=None, skip=N
         # A thread only so the log lines carry the report's name; the next report waits for it.
         problems: list[str] = []
         t = threading.Thread(target=report_worker, name=label.strip(" ."),
-                             args=(cfg, report, from_date, to_date, day_dir / branch, problems))
+                             args=(cfg, report, from_date, to_date, DOWNLOAD_DIR / branch, problems))
         t.start()
         t.join()
         if problems:
@@ -852,7 +856,7 @@ def download_reports(jobs: list[tuple[Report, date, date]], on_done=None, skip=N
     if failed:
         log(f"Finished with problems. Not downloaded: {', '.join(failed)}")
     else:
-        log(f"SUCCESS: all {len(work)} report(s) downloaded to {day_dir}")
+        log(f"SUCCESS: all {len(work)} report(s) downloaded to {DOWNLOAD_DIR}")
     return failed
 
 
